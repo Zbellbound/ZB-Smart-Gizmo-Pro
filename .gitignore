@@ -1,0 +1,17 @@
+# Build output — reproducible from zb_smart_gizmo/, not source of truth
+Release/*.rbz
+Release/*_RBZ*/
+archive/legacy_release/*.rbz
+
+# Working snapshots — not source of truth, kept locally only.
+# (Trailing /* rather than / so the !negation below can still track the manifest.)
+backups/*
+!backups/README.md
+
+# Unused third-party license/signature file (see AUDIT_REPORT.md H1) —
+# excluded regardless of removal status so it can never re-enter history
+EW.lic
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

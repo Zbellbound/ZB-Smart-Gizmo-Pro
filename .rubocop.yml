@@ -1,0 +1,54 @@
+# Zbellbound / ZB Smart Gizmo Pro — dev-only RuboCop-SketchUp configuration.
+# NEVER shipped inside the extension package (Release Gate §13 / Tooling §9).
+#
+# Full gate, including SketchupRequirements/FileStructure (which needs a
+# directory containing *only* the root loader + matching support folder,
+# per rubocop-sketchup's own design) — run against an extracted copy of
+# the exact final RBZ, not the repo root:
+#
+#   unzip Release/ZB_Smart_Gizmo_<version>.rbz -d /tmp/rbz_audit
+#   cp .rubocop.yml /tmp/rbz_audit/
+#   cd /tmp/rbz_audit && rubocop .
+#
+# Day-to-day dev linting straight from the repo root — skip FileStructure
+# here, since Release/, test/, archive/, design/ sitting alongside
+# zb_smart_gizmo_pro/ will always over-count "support directories" for that
+# one cop; that's expected, not a real structural problem:
+#
+#   rubocop --except SketchupRequirements/FileStructure zb_smart_gizmo_pro.rb zb_smart_gizmo_pro/
+
+plugins:
+  - rubocop-sketchup
+
+AllCops:
+  SketchUp:
+    SourcePath: .
+    TargetSketchUpVersion: 2023
+  Exclude:
+    - 'Release/**/*'
+    - 'archive/**/*'
+    - 'design/**/*'
+    - 'test/**/*'
+    - '.agents/**/*'
+    - '.claude/**/*'
+
+# This file's only job is the Warehouse SketchUp-compliance gate — keep
+# its output limited to that, not the ~300 general Ruby style/lint
+# offenses a bare `rubocop` run would otherwise report across this
+# codebase (out of scope for this gate; a separate, optional concern).
+Lint:
+  Enabled: false
+Style:
+  Enabled: false
+Layout:
+  Enabled: false
+Metrics:
+  Enabled: false
+Naming:
+  Enabled: false
+Security:
+  Enabled: false
+Gemspec:
+  Enabled: false
+Bundler:
+  Enabled: false
