@@ -164,8 +164,9 @@ class LicensingTest < Minitest::Test
     assert_includes Licensing::TRIAL_EXPIRED_MESSAGE, 'trial has ended'
     assert_includes Licensing::EXPIRED_MESSAGE, 'expired'
     assert_includes Licensing::NOT_LICENSED_MESSAGE, 'needs a valid Extension Warehouse license'
-    refute_match(/trial/i, Licensing::NOT_LICENSED_MESSAGE,
-                 'a Pro trial is not provable from source; restore the trial wording only once the listing is confirmed to offer one')
+    assert_includes Licensing::NOT_LICENSED_MESSAGE,
+                    'Purchase a license or start the free trial from the SketchUp Extension Warehouse.',
+                    'the listing offers a 14-day trial, so the message points at it'
     assert_includes Licensing::UNVERIFIED_MESSAGE, 'could not check its license'
   end
 

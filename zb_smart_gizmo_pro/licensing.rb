@@ -35,14 +35,12 @@ module Zbellbound
       EXPIRED_MESSAGE =
         'Your ZB Smart Gizmo Pro license has expired. To keep using it, renew it ' \
         'from the SketchUp Extension Warehouse.'
-      # Trial-neutral on purpose: whether the Pro listing offers a trial is a
-      # Developer Portal setting that cannot be proven from this source, so the
-      # wording promises none. (A state of TRIAL_EXPIRED can only occur when a
-      # trial exists, so that message may keep saying "trial".) Restore
-      # "or start the free trial" only once the listing is confirmed to offer one.
+      # The Pro listing offers a 14-day full-feature trial (a Developer Portal
+      # setting, confirmed by the product owner), so the not-licensed wording
+      # points at both a purchase and the free trial.
       NOT_LICENSED_MESSAGE =
         'ZB Smart Gizmo Pro needs a valid Extension Warehouse license. Purchase a license ' \
-        'from the SketchUp Extension Warehouse.'
+        'or start the free trial from the SketchUp Extension Warehouse.'
       UNVERIFIED_MESSAGE =
         'ZB Smart Gizmo Pro could not check its license. Sign in to SketchUp, then update the ' \
         'license from Extension Manager and try again.'
