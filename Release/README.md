@@ -6,7 +6,7 @@ then again after the folder was cleaned up post-release.
 
 ## Current contents
 
-**Updated 2026-09-21** — **1.5.4 is the production candidate for `ZB Smart Gizmo Pro`.** It adds
+**Updated 2026-09-21** — **1.5.4 is the approved, published production package for `ZB Smart Gizmo Pro`.** It adds
 Extension Warehouse licensing to the Pro identity, reusing the approved ZB Smart Bevel v1.13
 pattern: SketchUp's own `Sketchup::Licensing` API is the only source of truth (no Zbellbound
 account, activation server, product key, network call or stored preference), `licensed? == true` —
@@ -18,10 +18,21 @@ never need a license. `PLUGIN_NAME` (`ZB Smart Gizmo Pro`), `PLUGIN_ID` (`zb_sma
 preference key and default (Handle Size 80, Smart Scale Yes) and all Move, Rotate, Scale, Pivot,
 array and Smart Scale behavior are unchanged from 1.5.3.
 
-- **`ZB_Smart_Gizmo_Pro_1.5.4_Warehouse_Final.rbz`** — the 1.5.4 production candidate, built from the
-  committed blobs of the production commit (git-ignored like every `Release/*.rbz`). 10 entries: the
-  nine 1.5.3 runtime files plus `zb_smart_gizmo_pro/licensing.rb`. Size, SHA-256 and release facts
-  are recorded here once it is published.
+- **`ZB_Smart_Gizmo_Pro_1.5.4_Warehouse_Final.rbz`** (200,306 B) — **the approved 1.5.4 release
+  artifact.** Built from the committed blobs of production commit `b9abc6d` ("Bump version to 1.5.4,
+  mark Release/README.md 1.5.4 as production candidate"), which follows the merge of
+  `feature/extension-warehouse-licensing` (merge commit `a79323e`) into `main`. 10 entries: the nine
+  1.5.3 runtime files plus `zb_smart_gizmo_pro/licensing.rb`. Passed the full Zbellbound release gate
+  (283 tests / 2404 assertions, 0 failures; `ruby -c`; both RuboCop-SketchUp gates, 0 offenses;
+  extensionless-`Sketchup.require` and simulated-`.rbe` checks; licensing identifier and
+  activation-route audit; console-output, rescue, vector-icon and package-hygiene audits; no `.lic`,
+  signature, DEV label or test content). Its licensing architecture is the ZB Smart Bevel v1.13
+  pattern that was live-tested there; by the product owner's decision no further live licensing test
+  was run on this package, and a real-`.rbe` encryption load test is still separate. Tagged `v1.5.4`
+  (annotated, on `b9abc6d`) and published as a GitHub release, with the published asset independently
+  re-downloaded and re-verified against this size/hash. Not yet submitted to the Extension Warehouse.
+  `54c3dcad5d098c4879a1aed03c55475f463a376469bcdf5f34d7bbaafe2ca80c`
+- **`README.md`** — this file.
 
 **Updated 2026-09-09** — `ZB Smart Gizmo Pro` 1.5.3 was the first release of the new
 Extension Warehouse identity (no licensing code):
