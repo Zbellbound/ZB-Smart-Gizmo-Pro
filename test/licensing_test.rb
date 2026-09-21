@@ -164,6 +164,8 @@ class LicensingTest < Minitest::Test
     assert_includes Licensing::TRIAL_EXPIRED_MESSAGE, 'trial has ended'
     assert_includes Licensing::EXPIRED_MESSAGE, 'expired'
     assert_includes Licensing::NOT_LICENSED_MESSAGE, 'needs a valid Extension Warehouse license'
+    refute_match(/trial/i, Licensing::NOT_LICENSED_MESSAGE,
+                 'a Pro trial is not provable from source; restore the trial wording only once the listing is confirmed to offer one')
     assert_includes Licensing::UNVERIFIED_MESSAGE, 'could not check its license'
   end
 
@@ -393,7 +395,8 @@ class LicensingTest < Minitest::Test
 
       content = File.read(File.join(ROOT, path), encoding: 'UTF-8', invalid: :replace, undef: :replace)
       refute_match(/^\s*LICENSE\s+trmbldg\b/, content, "#{path} must not contain a Warehouse license record")
-      refute_match(/\bsig\s*=\s*"[^"]{20,}"/, content, "#{path} must not contain a license signature")
+      refute_match(/\bsig\s*=\s*"/, content, "#{path} must not contain any license signature, not even a prefix")
+      refute_match(/\bcustomer\s*=\s*\S/, content, "#{path} must not contain a license record's customer value")
     end
   end
 

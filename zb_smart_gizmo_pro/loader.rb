@@ -132,10 +132,11 @@ module Zbellbound
         self.rotate_down_arrow_step = result[11]
 
         # Saving Preferences must never (re)start the overlay for an
-        # unlicensed installation: the refresh below runs only when a fresh,
-        # silent license check permits it. Preferences itself stays available.
+        # unlicensed installation: one fresh, silent license check decides, and
+        # its boolean goes to start (which refuses when it is false).
+        # Preferences itself stays available either way.
         overlay = active_overlay
-        overlay.start if overlay && Licensing.allowed?
+        overlay.start(authorized: Licensing.allowed?) if overlay
       end
 
       def self.scale_input_unit

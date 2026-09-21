@@ -36,7 +36,7 @@ module Zbellbound::SmartGizmoPro
       overlay.update_gizmo
     end
 
-    def attach_observers(model)
+    def attach_observers(model, authorized: nil)
       return unless model
 
       key = model.object_id
@@ -66,9 +66,22 @@ module Zbellbound::SmartGizmoPro
         model.tools.add_observer(existing[:tools]) if existing[:tools]
       end
 
+      activation_cycle(model, authorized)
+    end
+
+    # One activation cycle (startup, model open/new/activate, scene change,
+    # the toolbar command): ONE silent license lookup, whose boolean result is
+    # then passed -- and only that boolean, never a license object -- through
+    # the enable/start step and every retry timer of the cycle. A cycle
+    # therefore costs one lookup however many retries it schedules, and the
+    # next cycle (the user's next interaction) asks SketchUp afresh, so a
+    # changed license is recognized then. `authorized` lets an explicit
+    # toolbar/menu activation hand over the result of its own fresh check.
+    def activation_cycle(model, authorized = nil)
+      authorized = Licensing.allowed? if authorized.nil?
       overlay = ensure_overlay(model)
-      activate_overlay(model, overlay)
-      queue_overlay_activation(model)
+      activate_overlay(model, overlay, authorized: authorized)
+      queue_overlay_activation(model, authorized: authorized)
     end
 
     def ensure_overlay(model)
@@ -82,21 +95,27 @@ module Zbellbound::SmartGizmoPro
       nil
     end
 
-    def activate_overlay(model, overlay = nil)
+    # Enables and starts the overlay when `authorized` (the cycle's boolean; a
+    # standalone call makes its own single silent lookup). Unauthorized is
+    # silent and inert: nothing is enabled or started, no message is shown,
+    # and an overlay that already exists is told to stop drawing. The visible,
+    # user-initiated check lives in toggle_gizmo.
+    def activate_overlay(model, overlay = nil, authorized: nil)
       return unless model
-      # Every automatic activation route (startup, model open, scene change,
-      # the retry timers, the toolbar command) passes through here. A fresh,
-      # SILENT license check decides: an unlicensed installation never has
-      # its overlay enabled or started, and no message is ever shown from
-      # this path -- the visible, user-initiated check lives in toggle_gizmo.
-      return unless Licensing.allowed?
+
+      authorized = Licensing.allowed? if authorized.nil?
+      unless authorized
+        overlay ||= existing_overlay(model)
+        overlay.display_authorized = false if overlay.respond_to?(:display_authorized=)
+        return
+      end
 
       overlay ||= ensure_overlay(model)
       return unless overlay
 
       overlay.bind_model(model) if overlay.respond_to?(:bind_model)
       overlay.enabled = true unless overlay.enabled?
-      overlay.start(model)
+      overlay.start(model, authorized: true)
       overlay.selection_changed(model.selection)
       model.active_view.invalidate if model.active_view
       overlay
@@ -105,23 +124,27 @@ module Zbellbound::SmartGizmoPro
       nil
     end
 
-    def recreate_overlay(model)
+    def recreate_overlay(model, authorized: nil)
       return unless model
 
-      existing = model.overlays.to_a.find { |overlay| overlay.is_a?(Zbellbound::SmartGizmoPro::GizmoOverlay) }
+      authorized = Licensing.allowed? if authorized.nil?
+      existing = existing_overlay(model)
       model.overlays.remove(existing) if existing
       overlay = model.overlays.add(Zbellbound::SmartGizmoPro::GizmoOverlay.new)
-      activate_overlay(model, overlay)
-      queue_overlay_activation(model)
+      activate_overlay(model, overlay, authorized: authorized)
+      queue_overlay_activation(model, authorized: authorized)
     rescue ArgumentError => e
       warn_overlay_issue('recreate overlay', e)
       nil
     end
 
-    def queue_overlay_activation(model)
+    def queue_overlay_activation(model, authorized: nil)
       return unless model
-      # No retry timers for an unlicensed installation (silent check).
-      return unless Licensing.allowed?
+
+      authorized = Licensing.allowed? if authorized.nil?
+      # No retry timers for an unauthorized cycle. The retries below reuse this
+      # cycle's boolean; none of them looks the license up again.
+      return unless authorized
 
       key = model.object_id
       generation = @activation_generations.fetch(key, 0) + 1
@@ -134,20 +157,32 @@ module Zbellbound::SmartGizmoPro
 
           overlay = ensure_overlay(model)
           if overlay
-            activate_overlay(model, overlay)
+            activate_overlay(model, overlay, authorized: true)
           else
-            recreate_overlay(model)
+            recreate_overlay(model, authorized: true)
           end
         end
       end
     end
 
+    # Invalidates any activation retry still pending for the model, so a retry
+    # from an earlier cycle cannot switch a gizmo the user just hid back on.
+    # No license lookup: hiding never needs one.
+    def cancel_pending_activation(model)
+      return unless model
+
+      key = model.object_id
+      @activation_generations[key] = @activation_generations.fetch(key, 0) + 1
+    end
+
     def scene_changed(model)
       return unless model
 
-      overlay = ensure_overlay(model)
-      activate_overlay(model, overlay)
-      queue_overlay_activation(model)
+      activation_cycle(model)
+    end
+
+    def existing_overlay(model)
+      model.overlays.to_a.find { |overlay| overlay.is_a?(Zbellbound::SmartGizmoPro::GizmoOverlay) }
     end
 
     def warn_overlay_issue(action, error)

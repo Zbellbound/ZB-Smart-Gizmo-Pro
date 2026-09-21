@@ -13,14 +13,19 @@ module Zbellbound
     #
     # WHERE this runs (never as the only check at SketchUp startup, when
     # SketchUp skips automatic license fetching):
-    # * silently (allowed?) for every automatic activation route -- the
-    #   observer's model-open / scene-change activation, the overlay's own
-    #   start, and the post-Preferences refresh. No message is ever shown for
-    #   these, so nothing appears while SketchUp is loading a model.
-    # * visibly (authorize) for the toolbar/menu command and at the start of
-    #   every gizmo gesture and model-changing operation, so a refusal always
-    #   tells the user why and leaves the model untouched.
-    # Manual, About and Preferences are separate commands and are not gated.
+    # * silently (allowed?) ONCE per observer activation cycle (startup, model
+    #   open, scene change) -- the cycle's retries reuse that one boolean -- and
+    #   once per standalone overlay start (SketchUp's own Overlays panel) and
+    #   per post-Preferences refresh. That boolean, never a license object, is
+    #   what the overlay draws by. No message is ever shown for these, so
+    #   nothing appears while SketchUp is loading a model.
+    # * visibly (authorize), fresh every time, when the user turns the gizmo ON
+    #   from the toolbar/menu, at the start of every gizmo gesture, and before
+    #   every model-changing operation, so a refusal always tells the user why
+    #   and leaves the model untouched.
+    # Turning the gizmo OFF (toolbar, menu, the context-menu Hide) never checks
+    # the license. Manual, About and Preferences are separate commands and are
+    # not gated.
     module Licensing
       # User-facing text only: never a license state code, the identifier
       # below, an exception class or a backtrace.
@@ -30,9 +35,14 @@ module Zbellbound
       EXPIRED_MESSAGE =
         'Your ZB Smart Gizmo Pro license has expired. To keep using it, renew it ' \
         'from the SketchUp Extension Warehouse.'
+      # Trial-neutral on purpose: whether the Pro listing offers a trial is a
+      # Developer Portal setting that cannot be proven from this source, so the
+      # wording promises none. (A state of TRIAL_EXPIRED can only occur when a
+      # trial exists, so that message may keep saying "trial".) Restore
+      # "or start the free trial" only once the listing is confirmed to offer one.
       NOT_LICENSED_MESSAGE =
-        'ZB Smart Gizmo Pro needs a valid Extension Warehouse license. Purchase it, or start ' \
-        'the free trial, from the SketchUp Extension Warehouse.'
+        'ZB Smart Gizmo Pro needs a valid Extension Warehouse license. Purchase a license ' \
+        'from the SketchUp Extension Warehouse.'
       UNVERIFIED_MESSAGE =
         'ZB Smart Gizmo Pro could not check its license. Sign in to SketchUp, then update the ' \
         'license from Extension Manager and try again.'

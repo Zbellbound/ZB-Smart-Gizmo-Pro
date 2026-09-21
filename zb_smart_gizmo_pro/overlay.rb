@@ -2,41 +2,64 @@
 # ZB Smart Gizmo Pro
 
 module Zbellbound::SmartGizmoPro
+  # The toolbar button and the Extensions-menu item both land here.
+  #
+  # OFF never needs a license: while the gizmo is showing (enabled AND
+  # authorized), a click just hides it -- immediately, with no license lookup
+  # and no message. Only turning the gizmo ON is a user-initiated activation,
+  # and that gets a fresh, VISIBLE license check every time; the boolean it
+  # returns is handed on to the activation below, so one click costs one
+  # lookup. A refusal explains why and keeps the gizmo inactive.
   def self.toggle_gizmo
     model = Sketchup.active_model
     return unless model
 
-    # The toolbar button and the Extensions-menu item both land here: a
-    # user-initiated activation, so it gets a fresh, VISIBLE license check
-    # every time. A refusal explains why and keeps the gizmo inactive (an
-    # overlay SketchUp itself left enabled is switched off); nothing else
-    # runs, so the model and the observers are left exactly as they were.
+    overlay = PLUGIN.active_overlay(model)
+    if overlay&.enabled? && overlay.display_authorized?
+      PLUGIN.hide_gizmo(model)
+      return
+    end
+
     unless Licensing.authorize
-      refused = PLUGIN.active_overlay(model)
-      refused.enabled = false if refused&.enabled?
+      if overlay
+        overlay.display_authorized = false
+        overlay.enabled = false if overlay.enabled?
+      end
       model.active_view.invalidate if model.active_view
       return
     end
 
-    PLUGIN.observer&.attach_observers(model) if PLUGIN.respond_to?(:observer)
+    observer = PLUGIN.respond_to?(:observer) ? PLUGIN.observer : nil
+    observer&.attach_observers(model, authorized: true)
     overlay = PLUGIN.active_overlay(model)
     unless overlay
-      PLUGIN.observer&.recreate_overlay(model) if PLUGIN.respond_to?(:observer)
+      observer&.recreate_overlay(model, authorized: true)
       overlay = PLUGIN.active_overlay(model)
       return unless overlay
     end
 
-    enable = !overlay.enabled?
-    if enable
-      if PLUGIN.respond_to?(:observer)
-        PLUGIN.observer.activate_overlay(model, overlay)
+    unless overlay.enabled? && overlay.display_authorized?
+      if observer
+        observer.activate_overlay(model, overlay, authorized: true)
       else
         overlay.enabled = true
-        overlay.start
+        overlay.start(authorized: true)
       end
-    else
-      overlay.enabled = false
     end
+    model.active_view.invalidate if model.active_view
+  end
+
+  # Hides the gizmo. Unconditional by design: no license lookup, no message --
+  # the toolbar/menu toggle (when the gizmo is showing) and the gizmo's own
+  # context-menu Hide command both use this. Any activation retry still
+  # pending from an earlier observer cycle is cancelled so it cannot switch
+  # the gizmo straight back on.
+  def self.hide_gizmo(model = Sketchup.active_model)
+    return unless model
+
+    PLUGIN.observer&.cancel_pending_activation(model) if PLUGIN.respond_to?(:observer)
+    overlay = PLUGIN.active_overlay(model)
+    overlay.enabled = false if overlay&.enabled?
     model.active_view.invalidate if model.active_view
   end
 
@@ -430,6 +453,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onMouseMove(flags, x, y, view)
+      return if inert?
       return if @mouse && @mouse == [x, y]
       return if @native_tool_override
       
@@ -470,6 +494,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onLButtonDown(flags, x, y, view)
+      return if inert?
       return if @native_tool_override
 
       @flags = flags
@@ -533,6 +558,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onMouseEnter(*args)
+      return if inert?
       return unless enabled?
       return if @native_tool_override
       return unless active_gizmo?
@@ -928,12 +954,40 @@ module Zbellbound::SmartGizmoPro
       true
     end
 
-    def start(model = nil)
-      # Silent gate for every route that starts the overlay -- the observer,
-      # the toolbar command, the post-Preferences refresh and SketchUp's own
-      # Overlay controls. An unlicensed installation is never started and
-      # never shows a message from here.
-      return unless Licensing.allowed?
+    # The most recent SILENT authorization result, as a plain boolean (never a
+    # license object). It is set by every start -- so an unlicensed overlay
+    # that SketchUp's own Overlays panel switches on is refused here -- and it
+    # is all draw and the passive mouse callbacks consult, so the graphics
+    # never call Sketchup::Licensing. Until a start has authorized the overlay
+    # it is not authorized: nothing is drawn.
+    def display_authorized?
+      @display_authorized == true
+    end
+
+    def display_authorized=(value)
+      @display_authorized = value ? true : false
+    end
+
+    # An overlay that is not authorized is inert: it draws nothing, has no
+    # hover, tooltip, tool push, key handling or gizmo menu, and never leaves
+    # itself on the tool stack. Silent -- no lookup and no message.
+    def inert?
+      return false if display_authorized?
+
+      @model.tools.pop_tool if @model && active_itself?
+      true
+    end
+
+    # Starts (or refreshes) the overlay. `authorized` is the boolean result of
+    # ONE silent license lookup made by the caller for a whole activation
+    # cycle (observer events, retry timers, the toolbar command, Preferences)
+    # and passed along for that cycle only. Called without it -- by SketchUp's
+    # own Overlay controls -- start makes the one silent lookup itself and
+    # silently refuses when unlicensed.
+    def start(model = nil, authorized: nil)
+      authorized = Licensing.allowed? if authorized.nil?
+      self.display_authorized = authorized
+      return unless display_authorized?
 
       refresh_context(model)
 
@@ -3116,6 +3170,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def getMenu(menu, _flags, x, y, view)
+      return false if inert?
       return false unless gizmo_hovering?(x, y, view)
 
       ['Global', 'Object'].each_with_index do |name, i|
@@ -3138,8 +3193,10 @@ module Zbellbound::SmartGizmoPro
       menu.add_separator
       menu.add_item('Preferences...') { PLUGIN.open_preferences }
       menu.add_separator
-      menu.add_item('Hide') do 
-        PLUGIN.toggle_gizmo 
+      # Hide never needs a license: it goes straight to hide_gizmo, with no
+      # lookup and no message.
+      menu.add_item('Hide') do
+        PLUGIN.hide_gizmo
         Sketchup.active_model.tools.pop_tool
       end
 
@@ -3414,6 +3471,8 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onKeyDown(key, _repeat, _flags, view)
+      return if inert?
+
       if key == MOVE_TOOL_KEY
         activate_native_move_tool(view)
         return
@@ -3448,6 +3507,9 @@ module Zbellbound::SmartGizmoPro
     end
 
     def draw(view)
+      # Nothing is drawn unless the most recent silent authorization said yes;
+      # draw never asks SketchUp about the license itself.
+      return unless display_authorized?
       return if @native_tool_override
       return unless active_gizmo? && @gizmo
       sync_gizmo_refresh

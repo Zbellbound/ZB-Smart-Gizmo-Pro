@@ -74,10 +74,11 @@ class LicensingGateTest < Minitest::Test
   end
 
   class FakeTools
-    attr_reader :pushed
+    attr_reader :pushed, :popped
 
     def initialize
       @pushed = []
+      @popped = 0
     end
 
     def add_observer(_observer); end
@@ -86,7 +87,9 @@ class LicensingGateTest < Minitest::Test
       @pushed << tool
     end
 
-    def pop_tool; end
+    def pop_tool
+      @popped += 1
+    end
   end
 
   # A model with an overlay collection, for the observer / toggle routes.
@@ -129,6 +132,7 @@ class LicensingGateTest < Minitest::Test
     UI.last_messagebox_text = nil
     UI.last_inputbox_args = nil
     UI.started_timers = []
+    UI.timer_blocks = []
     Sketchup.active_model = nil
     P::PLUGIN.test_smart_scale_enabled = false
     P::PLUGIN.test_gizmo_orientation = P::GLOBAL_ORIENTATION
@@ -144,7 +148,12 @@ class LicensingGateTest < Minitest::Test
   # it, so a route's own license gate can be observed in isolation.
   def spy_overlay(calls)
     overlay = P::GizmoOverlay.allocate
-    overlay.define_singleton_method(:start) { |*args| calls << [:start, *args] }
+    # start records the model and the boolean it was handed, and -- like the real
+    # one -- records that result as the overlay's display authorization.
+    overlay.define_singleton_method(:start) do |model = nil, authorized: nil|
+      calls << [:start, model, authorized]
+      self.display_authorized = authorized == true
+    end
     overlay.define_singleton_method(:bind_model) { |model| calls << [:bind_model, model] }
     overlay.define_singleton_method(:selection_changed) { |_selection| calls << [:selection_changed] }
     overlay.define_singleton_method(:enabled=) do |value|
@@ -192,7 +201,7 @@ class LicensingGateTest < Minitest::Test
 
     assert_same overlay, result
     assert_includes calls, [:enabled=, true]
-    assert_includes calls, [:start, model]
+    assert_includes calls, [:start, model, true]
     assert_nil UI.last_messagebox_text
   end
 
@@ -201,7 +210,7 @@ class LicensingGateTest < Minitest::Test
     overlay = spy_overlay(calls)
     model = FakeOverlayModel.new([overlay])
     TestLicense.with_state(L::TRIAL) { build_observer.activate_overlay(model, overlay) }
-    assert_includes calls, [:start, model]
+    assert_includes calls, [:start, model, true]
   end
 
   def test_every_refusal_state_and_a_failing_lookup_keep_the_overlay_inactive_silently
@@ -236,12 +245,15 @@ class LicensingGateTest < Minitest::Test
     model = FakeOverlayModel.new([overlay])
     observer = build_observer
 
+    lookups = nil
     TestLicense.unlicensed do
       observer.scene_changed(model)
       observer.attach_observers(model)
       observer.attach_observers(model) # model re-open / File>Open re-attachment branch
+      lookups = L.requested_ids.length
     end
 
+    assert_equal 3, lookups, 'one silent lookup per activation cycle'
     assert_empty calls
     assert_empty UI.started_timers
     assert_nil UI.last_messagebox_text
@@ -255,7 +267,7 @@ class LicensingGateTest < Minitest::Test
 
     TestLicense.with_state(L::LICENSED) { build_observer.attach_observers(model) }
 
-    assert_includes calls, [:start, model]
+    assert_includes calls, [:start, model, true]
     assert_equal 4, UI.started_timers.length
   end
 
@@ -272,7 +284,7 @@ class LicensingGateTest < Minitest::Test
 
     L.state = L::LICENSED
     observer.activate_overlay(model, overlay)
-    assert_includes calls, [:start, model]
+    assert_includes calls, [:start, model, true]
 
     calls.clear
     L.state = L::EXPIRED
@@ -288,12 +300,22 @@ class LicensingGateTest < Minitest::Test
     reached = Class.new(StandardError)
     overlay.define_singleton_method(:refresh_context) { |*| raise reached }
 
-    TestLicense.unlicensed { overlay.start(Sketchup::Model.new) }
+    lookups = nil
+    TestLicense.unlicensed { overlay.start(Sketchup::Model.new); lookups = L.requested_ids.length }
     assert_nil UI.last_messagebox_text, 'start must never show a message'
+    refute overlay.display_authorized?, 'a refused start leaves the overlay unauthorized'
+    assert_equal 1, lookups, 'a standalone start makes its one silent lookup'
 
     assert_raises(reached, 'a licensed start proceeds past the gate') do
       TestLicense.with_state(L::LICENSED) { overlay.start(Sketchup::Model.new) }
     end
+    assert overlay.display_authorized?
+
+    # A caller that already holds the cycle boolean passes it: no second lookup.
+    lookups = nil
+    TestLicense.unlicensed { overlay.start(Sketchup::Model.new, authorized: false); lookups = L.requested_ids.length }
+    assert_equal 0, lookups
+    refute overlay.display_authorized?
   end
 
   # -- Toolbar and Extensions menu ---------------------------------------------
@@ -341,9 +363,10 @@ class LicensingGateTest < Minitest::Test
   def test_toolbar_refusal_does_not_touch_the_observers
     observer_calls = []
     fake_observer = Object.new
-    fake_observer.define_singleton_method(:attach_observers) { |m| observer_calls << [:attach_observers, m] }
-    fake_observer.define_singleton_method(:recreate_overlay) { |m| observer_calls << [:recreate_overlay, m] }
-    fake_observer.define_singleton_method(:activate_overlay) { |*a| observer_calls << [:activate_overlay, *a] }
+    fake_observer.define_singleton_method(:attach_observers) { |m, **kw| observer_calls << [:attach_observers, m, kw] }
+    fake_observer.define_singleton_method(:recreate_overlay) { |m, **kw| observer_calls << [:recreate_overlay, m, kw] }
+    fake_observer.define_singleton_method(:activate_overlay) { |*a, **kw| observer_calls << [:activate_overlay, *a, kw] }
+    fake_observer.define_singleton_method(:cancel_pending_activation) { |m| observer_calls << [:cancel_pending_activation, m] }
     Sketchup.active_model = FakeOverlayModel.new([spy_overlay([])])
 
     with_observer(fake_observer) { TestLicense.unlicensed { P.toggle_gizmo } }
@@ -363,7 +386,8 @@ class LicensingGateTest < Minitest::Test
 
       assert_nil UI.last_messagebox_text
       assert overlay.enabled?, "#{state}: the gizmo activates"
-      assert_includes calls, [:start]
+      assert_includes calls, [:start, nil, true]
+      assert overlay.display_authorized?, "#{state}: the gizmo is authorized to draw"
     end
   end
 
@@ -371,14 +395,17 @@ class LicensingGateTest < Minitest::Test
     observer_calls = []
     overlay = spy_overlay([])
     fake_observer = Object.new
-    fake_observer.define_singleton_method(:attach_observers) { |m| observer_calls << [:attach_observers, m] }
-    fake_observer.define_singleton_method(:activate_overlay) { |*a| observer_calls << [:activate_overlay, *a] }
+    fake_observer.define_singleton_method(:attach_observers) { |m, **kw| observer_calls << [:attach_observers, m, kw] }
+    fake_observer.define_singleton_method(:activate_overlay) { |*a, **kw| observer_calls << [:activate_overlay, *a, kw] }
     model = FakeOverlayModel.new([overlay])
     Sketchup.active_model = model
 
-    with_observer(fake_observer) { TestLicense.with_state(L::LICENSED) { P.toggle_gizmo } }
+    lookups = nil
+    with_observer(fake_observer) { TestLicense.with_state(L::LICENSED) { P.toggle_gizmo; lookups = L.requested_ids.length } }
 
-    assert_equal [[:attach_observers, model], [:activate_overlay, model, overlay]], observer_calls
+    assert_equal [[:attach_observers, model, { authorized: true }],
+                  [:activate_overlay, model, overlay, { authorized: true }]], observer_calls
+    assert_equal 1, lookups, 'the visible check hands its boolean on: one click, one lookup'
   end
 
   def test_each_toolbar_click_asks_sketchup_again
@@ -399,13 +426,29 @@ class LicensingGateTest < Minitest::Test
 
   # -- Direct overlay routes ----------------------------------------------------
 
-  def gesture_overlay(entity)
+  # An overlay SketchUp has enabled. `authorized` is the most recent silent
+  # authorization result the overlay holds: true for an overlay a licensed
+  # activation started, false for one SketchUp's own Overlays panel switched on
+  # while unlicensed.
+  def gesture_overlay(entity, authorized: true)
     @model = Sketchup::Model.new
     @model.selection.instance_variable_set(:@list, [entity])
     overlay = TestHarness.build_overlay(model: @model, selection: @model.selection)
     overlay.instance_variable_set(:@active_gizmo, true)
     overlay.enabled = true
+    overlay.display_authorized = authorized
     overlay
+  end
+
+  # Runs the block under a license state and returns how many license lookups
+  # it made (captured inside the block: the state helper resets the stub after).
+  def lookups_during(state = L::NOT_LICENSED, **opts)
+    count = nil
+    TestLicense.with_state(state, **opts) do
+      yield
+      count = L.requested_ids.length
+    end
+    count
   end
 
   def geometry_snapshot(entity)
@@ -697,10 +740,10 @@ class LicensingGateTest < Minitest::Test
     P::PLUGIN.define_singleton_method(:open_preferences) { opened << :preferences }
     menu = menu_for(overlay)
 
-    TestLicense.unlicensed { menu.items['Preferences...'].call }
+    lookups = lookups_during { menu.items['Preferences...'].call }
 
     assert_equal [:preferences], opened
-    assert_empty L.requested_ids
+    assert_equal 0, lookups
     assert_nil UI.last_messagebox_text
   ensure
     P::PLUGIN.singleton_class.send(:remove_method, :open_preferences)
@@ -730,10 +773,10 @@ class LicensingGateTest < Minitest::Test
     host = loader_host
     host.class_eval("class << self\n#{source.gsub(/^ {6}def self\./, '  def ')}\nend")
 
-    TestLicense.unlicensed { host.open_about }
+    lookups = lookups_during { host.open_about }
 
     assert_equal "ZB Smart Gizmo Pro 1.5.3\n\nDeveloper: Peter Zbel\nWebsite: www.zbellbound.com", UI.last_messagebox_text
-    assert_empty L.requested_ids
+    assert_equal 0, lookups
   end
 
   def test_manual_stays_available_and_never_consults_the_license
@@ -752,10 +795,10 @@ class LicensingGateTest < Minitest::Test
     host.singleton_class.send(:attr_accessor, :manual_dialog)
     host.class_eval("class << self\n#{source.gsub(/^ {6}def self\./, '  def ')}\nend")
 
-    TestLicense.unlicensed { host.open_manual }
+    lookups = lookups_during { host.open_manual }
 
     assert_equal [[:html, '<html></html>'], :show], shown
-    assert_empty L.requested_ids
+    assert_equal 0, lookups
     assert_nil UI.last_messagebox_text
   ensure
     UI.send(:remove_const, :HtmlDialog) if UI.const_defined?(:HtmlDialog, false)
@@ -797,12 +840,14 @@ class LicensingGateTest < Minitest::Test
   def test_preferences_save_but_cannot_restart_an_unlicensed_overlay
     calls = []
     overlay = Object.new
-    overlay.define_singleton_method(:start) { |*| calls << :start }
+    overlay.define_singleton_method(:start) { |*args| calls << args }
     host = preferences_host(overlay)
 
     save_preferences_through(host) { L.reset!; L.state = L::NOT_LICENSED }
 
-    assert_empty calls, 'saving Preferences must not start an unlicensed overlay'
+    assert_equal [[{ authorized: false }]], calls,
+                 'saving Preferences hands start the refusal (which starts nothing), never an authorization'
+    assert_equal 1, L.requested_ids.length, 'one silent lookup'
     assert_nil UI.last_messagebox_text, 'no message: Preferences stays quiet'
     saved = Sketchup.default_registry['ZB Smart Gizmo Pro']
     assert_equal 100, saved['gizmo_size'], 'the preferences themselves are still saved'
@@ -815,12 +860,13 @@ class LicensingGateTest < Minitest::Test
     [L::LICENSED, L::TRIAL].each do |state|
       calls = []
       overlay = Object.new
-      overlay.define_singleton_method(:start) { |*| calls << :start }
+      overlay.define_singleton_method(:start) { |*args| calls << args }
       host = preferences_host(overlay)
 
       save_preferences_through(host) { L.reset!; L.state = state }
 
-      assert_equal [:start], calls, "#{state}: the refresh still runs"
+      assert_equal [[{ authorized: true }]], calls, "#{state}: the refresh still runs"
+      assert_equal 1, L.requested_ids.length
     end
   end
 
@@ -828,6 +874,323 @@ class LicensingGateTest < Minitest::Test
     host = preferences_host(nil)
     save_preferences_through(host) { L.reset!; L.state = L::NOT_LICENSED }
     assert_empty L.requested_ids
+  end
+
+  # -- Hiding never needs a license -----------------------------------------------
+
+  def showing_overlay(calls)
+    overlay = spy_overlay(calls)
+    overlay.enabled = true
+    overlay.display_authorized = true
+    overlay
+  end
+
+  def test_toggling_off_hides_immediately_with_no_lookup_and_no_message
+    [
+      [L::LICENSED, {}], [L::TRIAL, {}], [L::NOT_LICENSED, {}], [L::EXPIRED, {}], [L::TRIAL_EXPIRED, {}],
+      [99, { licensed: false }], [:nil_license, {}], [nil, { raises: RuntimeError.new('offline') }]
+    ].each do |state, opts|
+      overlay = showing_overlay([])
+      Sketchup.active_model = FakeOverlayModel.new([overlay])
+      UI.last_messagebox_text = nil
+
+      lookups = lookups_during(state, **opts) { P.toggle_gizmo }
+
+      refute overlay.enabled?, "#{state.inspect}: turning OFF must work immediately"
+      assert_equal 0, lookups, 'turning OFF must not look the license up'
+      assert_nil UI.last_messagebox_text, 'turning OFF must never show a message'
+    end
+  end
+
+  def test_hide_gizmo_is_unconditional
+    [[L::NOT_LICENSED, {}], [nil, { raises: RuntimeError.new('offline') }]].each do |state, opts|
+      overlay = showing_overlay([])
+      Sketchup.active_model = FakeOverlayModel.new([overlay])
+
+      lookups = lookups_during(state, **opts) { P.hide_gizmo }
+
+      refute overlay.enabled?
+      assert_equal 0, lookups
+      assert_nil UI.last_messagebox_text
+    end
+    assert_nil P.hide_gizmo(nil), 'no model: nothing to hide, nothing raised'
+  end
+
+  def test_the_hide_menu_item_hides_immediately_with_no_lookup_and_no_message
+    [[L::NOT_LICENSED, {}], [L::EXPIRED, {}], [nil, { raises: RuntimeError.new('offline') }], [L::LICENSED, {}]].each do |state, opts|
+      @model = Sketchup::Model.new
+      overlay = showing_overlay([])
+      model = FakeOverlayModel.new([overlay])
+      Sketchup.active_model = model
+      menu = menu_for(overlay)
+      UI.last_messagebox_text = nil
+
+      lookups = lookups_during(state, **opts) { menu.items['Hide'].call }
+
+      refute overlay.enabled?, "#{state.inspect}: Hide must always work"
+      assert_equal 0, lookups, 'Hide must not look the license up'
+      assert_nil UI.last_messagebox_text, 'Hide must never show a message'
+      assert_equal 1, model.tools.popped, 'Hide still leaves the gizmo tool as before'
+    end
+  end
+
+  def test_hiding_cancels_pending_activation_retries_so_the_gizmo_stays_hidden
+    calls = []
+    overlay = spy_overlay(calls)
+    model = FakeOverlayModel.new([overlay])
+    Sketchup.active_model = model
+    observer = build_observer
+
+    with_observer(observer) do
+      TestLicense.with_state(L::LICENSED) do
+        observer.attach_observers(model) # a licensed cycle: enabled, four retries pending
+        assert overlay.enabled?
+        starts_before = calls.count { |call| call.first == :start }
+
+        P.toggle_gizmo # showing -> hides, cancelling the pending retries
+
+        refute overlay.enabled?
+        UI.timer_blocks.each(&:call)
+        refute overlay.enabled?, 'a retry from the earlier cycle must not switch the hidden gizmo back on'
+        assert_equal starts_before, calls.count { |call| call.first == :start }
+      end
+    end
+  end
+
+  def test_only_turning_on_needs_a_license_and_a_refused_on_leaves_it_off
+    overlay = spy_overlay([])
+    Sketchup.active_model = FakeOverlayModel.new([overlay])
+
+    TestLicense.unlicensed { P.toggle_gizmo }
+
+    assert_equal NOT_LICENSED_MESSAGE, UI.last_messagebox_text
+    refute overlay.enabled?
+    refute overlay.display_authorized?
+  end
+
+  # -- SketchUp's own Overlays panel -----------------------------------------------
+
+  def draw_recorder(overlay)
+    draws = []
+    TestHarness.gizmo_of(overlay).define_singleton_method(:draw) { |view| draws << view }
+    draws
+  end
+
+  def test_an_unlicensed_native_overlay_enable_draws_nothing
+    overlay = gesture_overlay(TestFixtures.group_box, authorized: false)
+    draws = draw_recorder(overlay)
+    lookups = nil
+
+    TestLicense.unlicensed do
+      overlay.start # SketchUp's own Overlays panel starting the overlay
+      40.times { overlay.draw(@model.active_view) }
+      lookups = L.requested_ids.length
+    end
+
+    assert_empty draws, 'no gizmo graphics may be drawn for an unlicensed overlay'
+    refute overlay.display_authorized?
+    assert_equal 1, lookups, 'start makes one silent lookup; draw never asks SketchUp'
+    assert_nil UI.last_messagebox_text, 'silent: no message'
+  end
+
+  def test_a_never_authorized_overlay_draws_nothing_even_before_any_start
+    overlay = gesture_overlay(TestFixtures.group_box, authorized: false)
+    draws = draw_recorder(overlay)
+    overlay.instance_variable_set(:@display_authorized, nil)
+
+    lookups = lookups_during(L::LICENSED) { 10.times { overlay.draw(@model.active_view) } }
+
+    assert_empty draws
+    assert_equal 0, lookups
+  end
+
+  def test_an_authorized_overlay_draws_and_draw_never_calls_the_license_api
+    overlay = gesture_overlay(TestFixtures.group_box, authorized: true)
+    draws = draw_recorder(overlay)
+
+    lookups = lookups_during(L::LICENSED) { 25.times { overlay.draw(@model.active_view) } }
+
+    assert_equal 25, draws.length
+    assert_equal 0, lookups, 'draw must not call Sketchup::Licensing, even 25 frames in a row'
+  end
+
+  def test_a_lapsed_license_stops_the_next_activation_cycle_drawing
+    overlay = gesture_overlay(TestFixtures.group_box, authorized: true)
+    draws = draw_recorder(overlay)
+    model = FakeOverlayModel.new([overlay])
+    observer = build_observer
+
+    TestLicense.unlicensed { observer.scene_changed(model) }
+    overlay.draw(@model.active_view)
+
+    refute overlay.display_authorized?
+    assert_empty draws, 'the cycle result (false) is what draw follows'
+  end
+
+  def test_an_unauthorized_overlay_is_inert_for_mouse_keys_and_the_gizmo_menu
+    overlay = gesture_overlay(TestFixtures.group_box, authorized: false)
+    gizmo = TestHarness.gizmo_of(overlay)
+    downs = []
+    gizmo.define_singleton_method(:prepick?) { |*| true }
+    gizmo.define_singleton_method(:mouse_over?) { true }
+    gizmo.define_singleton_method(:tooltip) { 'Move' }
+    gizmo.define_singleton_method(:onMouseMove) { |*| true }
+    gizmo.define_singleton_method(:onLButtonDown) { |*args| downs << args; true }
+    menu = FakeMenu.new
+    menu_shown = nil
+
+    lookups = lookups_during do
+      overlay.onMouseMove(0, 5, 5, @model.active_view)
+      overlay.onMouseEnter(0, 6, 6, @model.active_view)
+      overlay.onLButtonDown(0, 5, 5, @model.active_view)
+      overlay.onKeyDown(0x25, 1, 0, @model.active_view)
+      menu_shown = overlay.getMenu(menu, 0, 5, 5, @model.active_view)
+    end
+
+    assert_empty downs, 'an invisible gizmo must not react to a click'
+    assert_equal false, menu_shown
+    assert_empty menu.items
+    assert_equal 0, lookups, 'inert means no license lookups at all'
+    assert_nil UI.last_messagebox_text, 'and no message: an invisible gizmo cannot nag'
+  end
+
+  def test_an_unauthorized_overlay_never_leaves_itself_on_the_tool_stack
+    overlay = gesture_overlay(TestFixtures.group_box, authorized: false)
+    model = FakeOverlayModel.new([overlay])
+    overlay.instance_variable_set(:@model, model)
+    overlay.instance_variable_set(:@tool_active, true)
+
+    overlay.onMouseMove(0, 5, 5, @model.active_view)
+
+    assert_equal 1, model.tools.popped
+  end
+
+  def test_a_later_valid_toolbar_activation_succeeds_after_an_unlicensed_native_enable
+    overlay = gesture_overlay(TestFixtures.group_box, authorized: false) # enabled by SketchUp, refused by start
+    draws = draw_recorder(overlay)
+    starts = []
+    overlay.define_singleton_method(:start) do |_model = nil, authorized: nil|
+      starts << authorized
+      self.display_authorized = authorized == true
+    end
+    Sketchup.active_model = FakeOverlayModel.new([overlay])
+    overlay.draw(@model.active_view)
+    assert_empty draws, 'nothing is visible while unauthorized'
+
+    lookups = nil
+    TestLicense.with_state(L::LICENSED) do # the license has become valid since
+      P.toggle_gizmo
+      lookups = L.requested_ids.length
+    end
+
+    assert_nil UI.last_messagebox_text
+    assert_equal [true], starts, 'the explicit activation authorizes and starts the overlay'
+    assert overlay.display_authorized?
+    assert_equal 1, lookups, 'a fresh check, made once'
+    overlay.draw(@model.active_view)
+    assert_equal 1, draws.length, 'and the gizmo is visible again'
+  end
+
+  # -- One silent lookup per observer activation cycle -------------------------------
+
+  def test_one_silent_lookup_per_observer_cycle_including_every_retry
+    %i[attach_observers scene_changed].each do |entry|
+      calls = []
+      overlay = spy_overlay(calls)
+      model = FakeOverlayModel.new([overlay])
+      UI.timer_blocks = []
+      lookups = nil
+      retry_starts = nil
+
+      TestLicense.with_state(L::LICENSED) do
+        build_observer.public_send(entry, model)
+        assert_equal 4, UI.timer_blocks.length, "#{entry}: the four retries are scheduled"
+        UI.timer_blocks.each(&:call)
+        lookups = L.requested_ids.length
+        retry_starts = calls.select { |call| call.first == :start }
+      end
+
+      assert_equal 1, lookups, "#{entry}: the whole cycle, retries included, costs one lookup"
+      assert_equal 5, retry_starts.length, "#{entry}: one immediate start and four retries"
+      assert(retry_starts.all? { |call| call.last == true }, 'each start carries the cycle boolean, not a license object')
+    end
+  end
+
+  def test_an_unauthorized_cycle_costs_one_lookup_and_schedules_nothing
+    calls = []
+    overlay = spy_overlay(calls)
+    model = FakeOverlayModel.new([overlay])
+
+    lookups = lookups_during(L::NOT_LICENSED) { build_observer.scene_changed(model) }
+
+    assert_equal 1, lookups
+    assert_empty UI.started_timers
+    assert_empty calls
+  end
+
+  def test_a_changed_license_is_recognized_by_the_next_cycle
+    calls = []
+    overlay = spy_overlay(calls)
+    model = FakeOverlayModel.new([overlay])
+    observer = build_observer
+    L.reset!
+
+    L.state = L::LICENSED
+    observer.scene_changed(model)
+    assert overlay.display_authorized?
+
+    L.state = L::NOT_LICENSED
+    observer.scene_changed(model)
+    refute overlay.display_authorized?, 'the lapse is recognized on the next cycle'
+
+    L.state = L::TRIAL
+    observer.scene_changed(model)
+    assert overlay.display_authorized?, 'and so is a license that has returned'
+
+    assert_equal 3, L.requested_ids.length
+    assert_equal 3, L.issued.map(&:object_id).uniq.length, 'each cycle received its own license object'
+  end
+
+  def test_the_cycle_boolean_is_the_only_thing_carried_between_lookup_and_retries
+    observer = build_observer
+    observer.scene_changed(FakeOverlayModel.new([spy_overlay([])]))
+    (observer.instance_variables - %i[@observed_models @activation_generations @app_observer @frame_change_observer]).each do |name|
+      value = observer.instance_variable_get(name)
+      refute_kind_of Sketchup::Licensing::ExtensionLicense, value
+      refute_kind_of Zbellbound::SmartGizmoPro::Licensing::Result, value
+    end
+    assert_empty Zbellbound::SmartGizmoPro::Licensing.instance_variables
+  end
+
+  # -- Explicit activation and every mutation still ask afresh ------------------------
+
+  def test_each_explicit_activation_and_each_mutation_asks_sketchup_afresh
+    group = TestFixtures.group_box
+    overlay = gesture_overlay(group, authorized: false)
+    overlay.enabled = false
+    overlay.define_singleton_method(:start) do |_model = nil, authorized: nil|
+      self.display_authorized = authorized == true
+    end
+    Sketchup.active_model = FakeOverlayModel.new([overlay])
+    step = Geom::Transformation.translation(Geom::Vector3d.new(0, 0, 250.mm))
+    L.reset!
+
+    L.state = L::NOT_LICENSED
+    P.toggle_gizmo # 1: refused activation
+    refute overlay.display_authorized?
+    L.state = L::LICENSED
+    P.toggle_gizmo # 2: activation now succeeds
+    assert overlay.display_authorized?
+    L.state = L::NOT_LICENSED
+    overlay.perform_copy_array(step, 1) # 3: refused mutation
+    L.state = L::LICENSED
+    overlay.perform_copy_array(step, 1) # 4: allowed mutation
+    L.state = L::EXPIRED
+    overlay.perform_copy_array(step, 1) # 5: refused again -- the license lapsed since the last one
+
+    assert_equal 5, L.requested_ids.length, 'every explicit activation and every mutation asks SketchUp'
+    assert_equal 5, L.issued.map(&:object_id).uniq.length, 'and each receives a brand-new license object'
+    assert_equal [:start, :commit], @model.operation_log.map(&:first), 'only the allowed mutation opened an operation'
   end
 
   # -- Preferences persistence is untouched -------------------------------------
