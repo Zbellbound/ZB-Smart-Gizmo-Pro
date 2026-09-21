@@ -6,6 +6,18 @@ module Zbellbound::SmartGizmoPro
     model = Sketchup.active_model
     return unless model
 
+    # The toolbar button and the Extensions-menu item both land here: a
+    # user-initiated activation, so it gets a fresh, VISIBLE license check
+    # every time. A refusal explains why and keeps the gizmo inactive (an
+    # overlay SketchUp itself left enabled is switched off); nothing else
+    # runs, so the model and the observers are left exactly as they were.
+    unless Licensing.authorize
+      refused = PLUGIN.active_overlay(model)
+      refused.enabled = false if refused&.enabled?
+      model.active_view.invalidate if model.active_view
+      return
+    end
+
     PLUGIN.observer&.attach_observers(model) if PLUGIN.respond_to?(:observer)
     overlay = PLUGIN.active_overlay(model)
     unless overlay
@@ -480,6 +492,13 @@ module Zbellbound::SmartGizmoPro
         return
       end
 
+      # First meaningful gizmo interaction: a fresh, visible license check
+      # before any gizmo gesture (drag, handle click, pivot drag) can begin.
+      # This is the only mouse route into the manipulator, so SketchUp's own
+      # Overlay controls cannot bypass it; passive mouse moves never reach
+      # here. A refusal explains why and stops the gesture before it starts.
+      return unless @gizmo.active? || license_permits_interaction?
+
       handled = @gizmo.onLButtonDown(flags, x, y, view)
       if !handled && active_itself? && !@gizmo.active? && !prepick
         handle_non_gizmo_selection_click(flags, x, y, view)
@@ -886,7 +905,36 @@ module Zbellbound::SmartGizmoPro
       }
     end
 
+    # The single doorway for the license gate inside the overlay. Visible on
+    # refusal (a plain message), fresh on every call, and only ever invoked
+    # when an interaction is BEGINNING -- never from a passive mouse-move
+    # frame, a draw, or an observer event.
+    def license_permits_interaction?
+      Licensing.authorize
+    end
+
+    # The single doorway to a model operation. Every path that changes the
+    # model opens its Undo operation through here, so a refused license
+    # leaves the model untouched and creates no Undo entry: the check runs
+    # BEFORE start_operation, never after. Takes the same name and the same
+    # next_transparent/transparent flags as Sketchup::Model#start_operation
+    # (every operation of this extension disables the UI for performance, so
+    # that flag is fixed); returns true when the operation was opened and
+    # false when it was refused.
+    def start_licensed_operation(name, next_transparent = false, transparent = false)
+      return false unless license_permits_interaction?
+
+      @model.start_operation(name, true, next_transparent, transparent)
+      true
+    end
+
     def start(model = nil)
+      # Silent gate for every route that starts the overlay -- the observer,
+      # the toolbar command, the post-Preferences refresh and SketchUp's own
+      # Overlay controls. An unlicensed installation is never started and
+      # never shows a message from here.
+      return unless Licensing.allowed?
+
       refresh_context(model)
 
       # Always mark refresh needed so the followup timers below have work
@@ -957,10 +1005,16 @@ module Zbellbound::SmartGizmoPro
         # A new drag is "beginning another operation" -- ends any open
         # Ctrl-drag array-input window from a previous copy.
         @ctrl_array_session = nil
-        @model.start_operation('Transform', true)
+        # Every gesture opens its Undo operation through the licensed
+        # doorway. The gesture-start check in onLButtonDown normally stops a
+        # refused gesture before it reaches here; if this one is refused
+        # anyway, the rest of the gesture is dropped -- no frame, click or
+        # commit below may touch the model.
+        @license_blocked_gesture = !start_licensed_operation('Transform')
       end
 
       @gizmo.on_transform do |transformation, t_total, data|
+        next if @license_blocked_gesture
         next if @selection.empty?
 
         data = enrich_scale_data(data)
@@ -1005,6 +1059,13 @@ module Zbellbound::SmartGizmoPro
       end
 
       @gizmo.on_transform_end do |_gizmo|
+        # A gesture refused at its start opened no operation, so there is
+        # nothing to commit and nothing to update.
+        if @license_blocked_gesture
+          @license_blocked_gesture = false
+          next
+        end
+
         # Reset on every transform-end; the copy branch below re-populates
         # it only when this commit actually created a Ctrl-drag copy to
         # divide into an array. Any other commit (plain move, rotate,
@@ -1099,6 +1160,8 @@ module Zbellbound::SmartGizmoPro
       end
 
       @gizmo.on_click do |data|
+        next if @license_blocked_gesture
+
         action_name, direction = data
         @last_smart_scale_session = nil if action_name == :scale
         move_axis = nil
@@ -1179,7 +1242,8 @@ module Zbellbound::SmartGizmoPro
         when :scale
           data = enrich_scale_data(data)
           if smart_scale_supported?(data)
-            @model.start_operation('Smart Scale', true)
+            next unless start_licensed_operation('Smart Scale')
+
             begin
               if smart_scale_multi_selection?
                 # Multiple objects selected: build a state per entity, apply
@@ -1534,7 +1598,8 @@ module Zbellbound::SmartGizmoPro
         return
       end
 
-      @model.start_operation('Copy Array', true)
+      return unless start_licensed_operation('Copy Array')
+
       begin
         new_entities = []
         cumulative = IDENTITY
@@ -1759,7 +1824,8 @@ module Zbellbound::SmartGizmoPro
         end
       end
 
-      @model.start_operation('Copy Array', true, false, true)
+      return unless start_licensed_operation('Copy Array', false, true)
+
       begin
         new_intermediates = []
         generated_indices = mode == :external ? (2..count) : (1...count)
@@ -3053,17 +3119,21 @@ module Zbellbound::SmartGizmoPro
       return false unless gizmo_hovering?(x, y, view)
 
       ['Global', 'Object'].each_with_index do |name, i|
-        cmd = menu.add_item(name) do 
-          PLUGIN.gizmo_orientation = i 
+        cmd = menu.add_item(name) do
+          # Gizmo actions from the context menu carry the same fresh license
+          # check as a gesture; Preferences and Hide stay ungated.
+          next unless license_permits_interaction?
+
+          PLUGIN.gizmo_orientation = i
           update_gizmo
         end
         menu.set_validation_proc(cmd) { PLUGIN.gizmo_orientation == i ? MF_CHECKED : MF_UNCHECKED }
       end
       menu.add_separator
-      menu.add_item('Reset Pivot To Selection Center') { set_pivot_to_selection_center }
-      menu.add_item('Set Pivot To Model Axes Origin') { set_pivot_to_model_origin }
+      menu.add_item('Reset Pivot To Selection Center') { set_pivot_to_selection_center if license_permits_interaction? }
+      menu.add_item('Set Pivot To Model Axes Origin') { set_pivot_to_model_origin if license_permits_interaction? }
       if selected_one_object?
-        menu.add_item('Set Pivot To Object Origin') { set_pivot_to_object_origin }
+        menu.add_item('Set Pivot To Object Origin') { set_pivot_to_object_origin if license_permits_interaction? }
       end
       menu.add_separator
       menu.add_item('Preferences...') { PLUGIN.open_preferences }
@@ -3095,7 +3165,8 @@ module Zbellbound::SmartGizmoPro
 
       data = @last_transform[2]
       if data[0] == :scale && smart_scale_supported?(data)
-        @model.start_operation('Smart Scale', true)
+        return unless start_licensed_operation('Smart Scale')
+
         begin
           state = @last_smart_scale_session
           state = build_smart_scale_gesture_state(data) unless state&.valid?
@@ -3148,7 +3219,8 @@ module Zbellbound::SmartGizmoPro
         return UI.messagebox('Invalid scale') if value.nil? || value == 0
       end
 
-      @model.start_operation("Re-edit", true)
+      return unless start_licensed_operation('Re-edit')
+
       reEdit(value)
       @model.commit_operation
 
@@ -3312,7 +3384,8 @@ module Zbellbound::SmartGizmoPro
       t_increment = rotate_transformation(origin, axis, increment)
       t_total = rotate_transformation(origin, axis, angle)
 
-      @model.start_operation('Re-edit', true)
+      return unless start_licensed_operation('Re-edit')
+
       @model.active_entities.transform_entities(t_increment, selected_entities)
       @model.commit_operation
 

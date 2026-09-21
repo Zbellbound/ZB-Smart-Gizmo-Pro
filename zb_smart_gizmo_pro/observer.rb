@@ -84,6 +84,12 @@ module Zbellbound::SmartGizmoPro
 
     def activate_overlay(model, overlay = nil)
       return unless model
+      # Every automatic activation route (startup, model open, scene change,
+      # the retry timers, the toolbar command) passes through here. A fresh,
+      # SILENT license check decides: an unlicensed installation never has
+      # its overlay enabled or started, and no message is ever shown from
+      # this path -- the visible, user-initiated check lives in toggle_gizmo.
+      return unless Licensing.allowed?
 
       overlay ||= ensure_overlay(model)
       return unless overlay
@@ -114,6 +120,8 @@ module Zbellbound::SmartGizmoPro
 
     def queue_overlay_activation(model)
       return unless model
+      # No retry timers for an unlicensed installation (silent check).
+      return unless Licensing.allowed?
 
       key = model.object_id
       generation = @activation_generations.fetch(key, 0) + 1

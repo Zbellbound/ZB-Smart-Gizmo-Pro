@@ -1338,9 +1338,13 @@ module UI
   class << self
     attr_accessor :last_messagebox_text
     attr_accessor :last_inputbox_args
+    # Test-double-only record of every UI.start_timer call (delay, repeat), so
+    # specs can prove whether an activation burst was scheduled at all.
+    attr_accessor :started_timers
   end
 
-  def self.start_timer(_delay, _repeat = false)
+  def self.start_timer(delay, repeat = false)
+    (self.started_timers ||= []) << [delay, repeat]
     nil
   end
 
