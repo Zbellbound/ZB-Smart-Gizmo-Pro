@@ -1,4 +1,5 @@
 require_relative 'sketchup_stubs'
+require_relative 'licensing_stub'
 
 module Zbellbound
   module SmartGizmoPro
@@ -60,4 +61,5 @@ end
 
 root = File.expand_path('../../zb_smart_gizmo_pro', __dir__)
 require File.join(root, 'utils.rb')
+require File.join(root, 'licensing.rb')
 require File.join(root, 'overlay.rb')

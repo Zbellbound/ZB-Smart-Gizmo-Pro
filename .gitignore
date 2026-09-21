@@ -12,6 +12,15 @@ backups/*
 # excluded regardless of removal status so it can never re-enter history
 EW.lic
 
+# SketchUp Extension Warehouse license records (EW.lic and any test license)
+# live in SketchUp's own ProgramData folder -- never inside this repository,
+# a package input, or a backup. Excluded by extension so no record or
+# signature can ever be committed or shipped.
+*.lic
+
+# Local DEV / live-test packages -- never committed as production artifacts
+Test Builds/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

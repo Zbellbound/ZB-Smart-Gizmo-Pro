@@ -18,8 +18,9 @@ not currently breaking normal use. **Low** = cosmetic/noise, safe to defer.
   `Release/ZB_Smart_Gizmo_RBZ/zb_smart_gizmo/EW.lic`, `Release/ZB_Smart_Gizmo_RBZ_Minimal/.../EW.lic`,
   `Release/ZB_Smart_Gizmo_RBZ_LegacyID/.../EW.lic`, `Release/ZB_Smart_Gizmo_RBZ_LegacyID_Minimal/.../EW.lic`,
   and `backups/2026-05-06_release-ready-checkpoint/EW.lic`.
-- **What it is:** its content is a license grant/signature block (`LICENSE trmbldg ... customer=ZBELLBOUND ...
-  sig="60P0451..."`) for some third-party build/licensing tool — not SketchUp, not this extension.
+- **What it is:** its content is a license grant/signature block (vendor, customer and signature fields; the
+  field values are intentionally not reproduced in this report) -- a licensing record, not source for this
+  extension.
 - **Confirmed:** `grep -r "EW.lic\|\.lic"` across the entire project returns **zero** references from any
   `.rb` file. The extension never reads this file at runtime (verified against `loader.rb`, `gizmo.rb`,
   `overlay.rb`, `observer.rb`, `utils.rb`, `native_backend.rb`).

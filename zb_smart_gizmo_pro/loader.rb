@@ -39,6 +39,9 @@ module Zbellbound
       UI.messagebox("#{PLUGIN_NAME} requires SketchUp 2023 or newer.")
     else
       Sketchup.require('zb_smart_gizmo_pro/utils')
+      # The Extension Warehouse license gate (see licensing.rb) is loaded
+      # before observer/overlay so every activation route can consult it.
+      Sketchup.require('zb_smart_gizmo_pro/licensing')
       Sketchup.require('zb_smart_gizmo_pro/observer')
       Sketchup.require('zb_smart_gizmo_pro/overlay')
       Sketchup.require('zb_smart_gizmo_pro/gizmo')
@@ -128,8 +131,12 @@ module Zbellbound
         self.rotate_up_arrow_step = result[10]
         self.rotate_down_arrow_step = result[11]
 
+        # Saving Preferences must never (re)start the overlay for an
+        # unlicensed installation: one fresh, silent license check decides, and
+        # its boolean goes to start (which refuses when it is false).
+        # Preferences itself stays available either way.
         overlay = active_overlay
-        overlay.start if overlay
+        overlay.start(authorized: Licensing.allowed?) if overlay
       end
 
       def self.scale_input_unit

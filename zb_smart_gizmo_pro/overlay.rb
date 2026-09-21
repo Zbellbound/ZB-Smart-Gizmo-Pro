@@ -2,29 +2,64 @@
 # ZB Smart Gizmo Pro
 
 module Zbellbound::SmartGizmoPro
+  # The toolbar button and the Extensions-menu item both land here.
+  #
+  # OFF never needs a license: while the gizmo is showing (enabled AND
+  # authorized), a click just hides it -- immediately, with no license lookup
+  # and no message. Only turning the gizmo ON is a user-initiated activation,
+  # and that gets a fresh, VISIBLE license check every time; the boolean it
+  # returns is handed on to the activation below, so one click costs one
+  # lookup. A refusal explains why and keeps the gizmo inactive.
   def self.toggle_gizmo
     model = Sketchup.active_model
     return unless model
 
-    PLUGIN.observer&.attach_observers(model) if PLUGIN.respond_to?(:observer)
+    overlay = PLUGIN.active_overlay(model)
+    if overlay&.enabled? && overlay.display_authorized?
+      PLUGIN.hide_gizmo(model)
+      return
+    end
+
+    unless Licensing.authorize
+      if overlay
+        overlay.display_authorized = false
+        overlay.enabled = false if overlay.enabled?
+      end
+      model.active_view.invalidate if model.active_view
+      return
+    end
+
+    observer = PLUGIN.respond_to?(:observer) ? PLUGIN.observer : nil
+    observer&.attach_observers(model, authorized: true)
     overlay = PLUGIN.active_overlay(model)
     unless overlay
-      PLUGIN.observer&.recreate_overlay(model) if PLUGIN.respond_to?(:observer)
+      observer&.recreate_overlay(model, authorized: true)
       overlay = PLUGIN.active_overlay(model)
       return unless overlay
     end
 
-    enable = !overlay.enabled?
-    if enable
-      if PLUGIN.respond_to?(:observer)
-        PLUGIN.observer.activate_overlay(model, overlay)
+    unless overlay.enabled? && overlay.display_authorized?
+      if observer
+        observer.activate_overlay(model, overlay, authorized: true)
       else
         overlay.enabled = true
-        overlay.start
+        overlay.start(authorized: true)
       end
-    else
-      overlay.enabled = false
     end
+    model.active_view.invalidate if model.active_view
+  end
+
+  # Hides the gizmo. Unconditional by design: no license lookup, no message --
+  # the toolbar/menu toggle (when the gizmo is showing) and the gizmo's own
+  # context-menu Hide command both use this. Any activation retry still
+  # pending from an earlier observer cycle is cancelled so it cannot switch
+  # the gizmo straight back on.
+  def self.hide_gizmo(model = Sketchup.active_model)
+    return unless model
+
+    PLUGIN.observer&.cancel_pending_activation(model) if PLUGIN.respond_to?(:observer)
+    overlay = PLUGIN.active_overlay(model)
+    overlay.enabled = false if overlay&.enabled?
     model.active_view.invalidate if model.active_view
   end
 
@@ -418,6 +453,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onMouseMove(flags, x, y, view)
+      return if inert?
       return if @mouse && @mouse == [x, y]
       return if @native_tool_override
       
@@ -458,6 +494,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onLButtonDown(flags, x, y, view)
+      return if inert?
       return if @native_tool_override
 
       @flags = flags
@@ -479,6 +516,13 @@ module Zbellbound::SmartGizmoPro
         end
         return
       end
+
+      # First meaningful gizmo interaction: a fresh, visible license check
+      # before any gizmo gesture (drag, handle click, pivot drag) can begin.
+      # This is the only mouse route into the manipulator, so SketchUp's own
+      # Overlay controls cannot bypass it; passive mouse moves never reach
+      # here. A refusal explains why and stops the gesture before it starts.
+      return unless @gizmo.active? || license_permits_interaction?
 
       handled = @gizmo.onLButtonDown(flags, x, y, view)
       if !handled && active_itself? && !@gizmo.active? && !prepick
@@ -514,6 +558,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onMouseEnter(*args)
+      return if inert?
       return unless enabled?
       return if @native_tool_override
       return unless active_gizmo?
@@ -886,7 +931,64 @@ module Zbellbound::SmartGizmoPro
       }
     end
 
-    def start(model = nil)
+    # The single doorway for the license gate inside the overlay. Visible on
+    # refusal (a plain message), fresh on every call, and only ever invoked
+    # when an interaction is BEGINNING -- never from a passive mouse-move
+    # frame, a draw, or an observer event.
+    def license_permits_interaction?
+      Licensing.authorize
+    end
+
+    # The single doorway to a model operation. Every path that changes the
+    # model opens its Undo operation through here, so a refused license
+    # leaves the model untouched and creates no Undo entry: the check runs
+    # BEFORE start_operation, never after. Takes the same name and the same
+    # next_transparent/transparent flags as Sketchup::Model#start_operation
+    # (every operation of this extension disables the UI for performance, so
+    # that flag is fixed); returns true when the operation was opened and
+    # false when it was refused.
+    def start_licensed_operation(name, next_transparent = false, transparent = false)
+      return false unless license_permits_interaction?
+
+      @model.start_operation(name, true, next_transparent, transparent)
+      true
+    end
+
+    # The most recent SILENT authorization result, as a plain boolean (never a
+    # license object). It is set by every start -- so an unlicensed overlay
+    # that SketchUp's own Overlays panel switches on is refused here -- and it
+    # is all draw and the passive mouse callbacks consult, so the graphics
+    # never call Sketchup::Licensing. Until a start has authorized the overlay
+    # it is not authorized: nothing is drawn.
+    def display_authorized?
+      @display_authorized == true
+    end
+
+    def display_authorized=(value)
+      @display_authorized = value ? true : false
+    end
+
+    # An overlay that is not authorized is inert: it draws nothing, has no
+    # hover, tooltip, tool push, key handling or gizmo menu, and never leaves
+    # itself on the tool stack. Silent -- no lookup and no message.
+    def inert?
+      return false if display_authorized?
+
+      @model.tools.pop_tool if @model && active_itself?
+      true
+    end
+
+    # Starts (or refreshes) the overlay. `authorized` is the boolean result of
+    # ONE silent license lookup made by the caller for a whole activation
+    # cycle (observer events, retry timers, the toolbar command, Preferences)
+    # and passed along for that cycle only. Called without it -- by SketchUp's
+    # own Overlay controls -- start makes the one silent lookup itself and
+    # silently refuses when unlicensed.
+    def start(model = nil, authorized: nil)
+      authorized = Licensing.allowed? if authorized.nil?
+      self.display_authorized = authorized
+      return unless display_authorized?
+
       refresh_context(model)
 
       # Always mark refresh needed so the followup timers below have work
@@ -957,10 +1059,16 @@ module Zbellbound::SmartGizmoPro
         # A new drag is "beginning another operation" -- ends any open
         # Ctrl-drag array-input window from a previous copy.
         @ctrl_array_session = nil
-        @model.start_operation('Transform', true)
+        # Every gesture opens its Undo operation through the licensed
+        # doorway. The gesture-start check in onLButtonDown normally stops a
+        # refused gesture before it reaches here; if this one is refused
+        # anyway, the rest of the gesture is dropped -- no frame, click or
+        # commit below may touch the model.
+        @license_blocked_gesture = !start_licensed_operation('Transform')
       end
 
       @gizmo.on_transform do |transformation, t_total, data|
+        next if @license_blocked_gesture
         next if @selection.empty?
 
         data = enrich_scale_data(data)
@@ -1005,6 +1113,13 @@ module Zbellbound::SmartGizmoPro
       end
 
       @gizmo.on_transform_end do |_gizmo|
+        # A gesture refused at its start opened no operation, so there is
+        # nothing to commit and nothing to update.
+        if @license_blocked_gesture
+          @license_blocked_gesture = false
+          next
+        end
+
         # Reset on every transform-end; the copy branch below re-populates
         # it only when this commit actually created a Ctrl-drag copy to
         # divide into an array. Any other commit (plain move, rotate,
@@ -1099,6 +1214,8 @@ module Zbellbound::SmartGizmoPro
       end
 
       @gizmo.on_click do |data|
+        next if @license_blocked_gesture
+
         action_name, direction = data
         @last_smart_scale_session = nil if action_name == :scale
         move_axis = nil
@@ -1179,7 +1296,8 @@ module Zbellbound::SmartGizmoPro
         when :scale
           data = enrich_scale_data(data)
           if smart_scale_supported?(data)
-            @model.start_operation('Smart Scale', true)
+            next unless start_licensed_operation('Smart Scale')
+
             begin
               if smart_scale_multi_selection?
                 # Multiple objects selected: build a state per entity, apply
@@ -1534,7 +1652,8 @@ module Zbellbound::SmartGizmoPro
         return
       end
 
-      @model.start_operation('Copy Array', true)
+      return unless start_licensed_operation('Copy Array')
+
       begin
         new_entities = []
         cumulative = IDENTITY
@@ -1759,7 +1878,8 @@ module Zbellbound::SmartGizmoPro
         end
       end
 
-      @model.start_operation('Copy Array', true, false, true)
+      return unless start_licensed_operation('Copy Array', false, true)
+
       begin
         new_intermediates = []
         generated_indices = mode == :external ? (2..count) : (1...count)
@@ -3050,26 +3170,33 @@ module Zbellbound::SmartGizmoPro
     end
 
     def getMenu(menu, _flags, x, y, view)
+      return false if inert?
       return false unless gizmo_hovering?(x, y, view)
 
       ['Global', 'Object'].each_with_index do |name, i|
-        cmd = menu.add_item(name) do 
-          PLUGIN.gizmo_orientation = i 
+        cmd = menu.add_item(name) do
+          # Gizmo actions from the context menu carry the same fresh license
+          # check as a gesture; Preferences and Hide stay ungated.
+          next unless license_permits_interaction?
+
+          PLUGIN.gizmo_orientation = i
           update_gizmo
         end
         menu.set_validation_proc(cmd) { PLUGIN.gizmo_orientation == i ? MF_CHECKED : MF_UNCHECKED }
       end
       menu.add_separator
-      menu.add_item('Reset Pivot To Selection Center') { set_pivot_to_selection_center }
-      menu.add_item('Set Pivot To Model Axes Origin') { set_pivot_to_model_origin }
+      menu.add_item('Reset Pivot To Selection Center') { set_pivot_to_selection_center if license_permits_interaction? }
+      menu.add_item('Set Pivot To Model Axes Origin') { set_pivot_to_model_origin if license_permits_interaction? }
       if selected_one_object?
-        menu.add_item('Set Pivot To Object Origin') { set_pivot_to_object_origin }
+        menu.add_item('Set Pivot To Object Origin') { set_pivot_to_object_origin if license_permits_interaction? }
       end
       menu.add_separator
       menu.add_item('Preferences...') { PLUGIN.open_preferences }
       menu.add_separator
-      menu.add_item('Hide') do 
-        PLUGIN.toggle_gizmo 
+      # Hide never needs a license: it goes straight to hide_gizmo, with no
+      # lookup and no message.
+      menu.add_item('Hide') do
+        PLUGIN.hide_gizmo
         Sketchup.active_model.tools.pop_tool
       end
 
@@ -3095,7 +3222,8 @@ module Zbellbound::SmartGizmoPro
 
       data = @last_transform[2]
       if data[0] == :scale && smart_scale_supported?(data)
-        @model.start_operation('Smart Scale', true)
+        return unless start_licensed_operation('Smart Scale')
+
         begin
           state = @last_smart_scale_session
           state = build_smart_scale_gesture_state(data) unless state&.valid?
@@ -3148,7 +3276,8 @@ module Zbellbound::SmartGizmoPro
         return UI.messagebox('Invalid scale') if value.nil? || value == 0
       end
 
-      @model.start_operation("Re-edit", true)
+      return unless start_licensed_operation('Re-edit')
+
       reEdit(value)
       @model.commit_operation
 
@@ -3312,7 +3441,8 @@ module Zbellbound::SmartGizmoPro
       t_increment = rotate_transformation(origin, axis, increment)
       t_total = rotate_transformation(origin, axis, angle)
 
-      @model.start_operation('Re-edit', true)
+      return unless start_licensed_operation('Re-edit')
+
       @model.active_entities.transform_entities(t_increment, selected_entities)
       @model.commit_operation
 
@@ -3341,6 +3471,8 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onKeyDown(key, _repeat, _flags, view)
+      return if inert?
+
       if key == MOVE_TOOL_KEY
         activate_native_move_tool(view)
         return
@@ -3375,6 +3507,9 @@ module Zbellbound::SmartGizmoPro
     end
 
     def draw(view)
+      # Nothing is drawn unless the most recent silent authorization said yes;
+      # draw never asks SketchUp about the license itself.
+      return unless display_authorized?
       return if @native_tool_override
       return unless active_gizmo? && @gizmo
       sync_gizmo_refresh
