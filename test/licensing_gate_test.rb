@@ -762,7 +762,7 @@ class LicensingGateTest < Minitest::Test
   def loader_host
     host = Module.new
     host.const_set(:PLUGIN_NAME, 'ZB Smart Gizmo Pro')
-    host.const_set(:PLUGIN_VERSION, '1.5.3')
+    host.const_set(:PLUGIN_VERSION, '1.5.4')
     host.const_set(:Licensing, Licensing)
     host
   end
@@ -775,7 +775,7 @@ class LicensingGateTest < Minitest::Test
 
     lookups = lookups_during { host.open_about }
 
-    assert_equal "ZB Smart Gizmo Pro 1.5.3\n\nDeveloper: Peter Zbel\nWebsite: www.zbellbound.com", UI.last_messagebox_text
+    assert_equal "ZB Smart Gizmo Pro 1.5.4\n\nDeveloper: Peter Zbel\nWebsite: www.zbellbound.com", UI.last_messagebox_text
     assert_equal 0, lookups
   end
 

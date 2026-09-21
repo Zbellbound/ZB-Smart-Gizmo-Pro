@@ -550,8 +550,8 @@ module Zbellbound
       end
 
       # Built entirely from PLUGIN_NAME/PLUGIN_VERSION (zb_smart_gizmo_pro.rb) --
-      # no version literal here, so a future version bump (or a DEV build's
-      # PLUGIN_VERSION override, e.g. '1.5.3 DEV') shows up automatically,
+      # no version literal here, so a future version bump (or a staged test
+      # build's PLUGIN_VERSION override) shows up automatically,
       # with no change needed in this file. Developer/website info is
       # unchanged from before this method showed a version at all.
       def self.open_about

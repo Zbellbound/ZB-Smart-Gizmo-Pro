@@ -6,17 +6,31 @@ then again after the folder was cleaned up post-release.
 
 ## Current contents
 
-**Updated 2026-09-09** — a new-identity Extension Warehouse candidate has been created for
-`ZB Smart Gizmo Pro`:
+**Updated 2026-09-21** — **1.5.4 is the production candidate for `ZB Smart Gizmo Pro`.** It adds
+Extension Warehouse licensing to the Pro identity, reusing the approved ZB Smart Bevel v1.13
+pattern: SketchUp's own `Sketchup::Licensing` API is the only source of truth (no Zbellbound
+account, activation server, product key, network call or stored preference), `licensed? == true` —
+a purchased license or the 14-day full-feature Warehouse trial — is the sole authority, and the
+license state only picks the refusal message. Nothing is cached: the observer's silent check runs
+once per activation cycle; the toolbar/menu (turning the gizmo ON), the first gizmo gesture and every
+model-changing operation ask SketchUp afresh; turning the gizmo OFF, Manual, About and Preferences
+never need a license. `PLUGIN_NAME` (`ZB Smart Gizmo Pro`), `PLUGIN_ID` (`zb_smart_gizmo_pro`), every
+preference key and default (Handle Size 80, Smart Scale Yes) and all Move, Rotate, Scale, Pivot,
+array and Smart Scale behavior are unchanged from 1.5.3.
 
-- **`ZB_Smart_Gizmo_Pro_1.5.3_Warehouse_Candidate.rbz`** (196,416 B) — new Extension Warehouse
-  identity candidate. Root loader `zb_smart_gizmo_pro.rb`, support folder `zb_smart_gizmo_pro/`,
-  `PLUGIN_NAME = 'ZB Smart Gizmo Pro'`, `PLUGIN_ID = 'zb_smart_gizmo_pro'`, namespace
-  `Zbellbound::SmartGizmoPro`, overlay ID `zbellbound.smart_gizmo_pro.overlay`. 9 entries. Passed
-  `ruby -c`, the full Ruby regression suite, source RuboCop-SketchUp, and extracted-candidate
-  RuboCop-SketchUp/FileStructure checks. Still requires independent read-only audit and real
-  SketchUp manual testing before upload.
-  `ead763862b04fd3436b9dd46d60186cc8062536b504275037bca2c72a140deb9`
+- **`ZB_Smart_Gizmo_Pro_1.5.4_Warehouse_Final.rbz`** — the 1.5.4 production candidate, built from the
+  committed blobs of the production commit (git-ignored like every `Release/*.rbz`). 10 entries: the
+  nine 1.5.3 runtime files plus `zb_smart_gizmo_pro/licensing.rb`. Size, SHA-256 and release facts
+  are recorded here once it is published.
+
+**Updated 2026-09-09** — `ZB Smart Gizmo Pro` 1.5.3 was the first release of the new
+Extension Warehouse identity (no licensing code):
+
+- **`ZB_Smart_Gizmo_Pro_1.5.3_Warehouse_Final.rbz`** (194,583 B) — published as GitHub release
+  `v1.5.3` (tag on `e1d7fd6`); unchanged and superseded by 1.5.4. 9 entries. Root loader
+  `zb_smart_gizmo_pro.rb`, support folder `zb_smart_gizmo_pro/`, namespace
+  `Zbellbound::SmartGizmoPro`, overlay ID `zbellbound.smart_gizmo_pro.overlay`.
+  `0032ea8a442ccc77dca7d8798780c19ee2cb7ebe25c2b5d7a74d74dc079b1575`
 
 **Updated 2026-09-07** — 1.5.3 is the current approved/published production package for the
 original `ZB Smart Gizmo` identity. It adds the installed version number to the built-in About

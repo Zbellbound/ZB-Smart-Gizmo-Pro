@@ -11,7 +11,7 @@ module Zbellbound
     PLUGIN_VENDOR    = 'Zbellbound'.freeze
     PLUGIN_ID        = 'zb_smart_gizmo_pro'.freeze
     PLUGIN_NAME      = 'ZB Smart Gizmo Pro'.freeze
-    PLUGIN_VERSION   = '1.5.3'.freeze
+    PLUGIN_VERSION   = '1.5.4'.freeze
     PLUGIN_COPYRIGHT = 'Copyright (c) Peter Zbel / Zbellbound'.freeze
     PLUGIN_CREATOR   = 'Peter Zbel / Zbellbound'.freeze
     PLUGIN_DESC      = 'Interactive transform gizmo overlay for SketchUp with Smart Scale for structured objects.'.freeze

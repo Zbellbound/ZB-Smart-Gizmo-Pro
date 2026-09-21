@@ -34,7 +34,7 @@ class AboutVersionDisplayTest < Minitest::Test
   # PLUGIN_VERSION and the REAL open_about body class_eval'd onto it, so
   # each test can exercise a different "installed version" without any
   # of them leaking into each other.
-  def about_module(name: 'ZB Smart Gizmo Pro', version: '1.5.3')
+  def about_module(name: 'ZB Smart Gizmo Pro', version: '1.5.4')
     host = Module.new
     host.class_eval(<<~RUBY)
       PLUGIN_NAME = #{name.inspect}
@@ -56,25 +56,25 @@ class AboutVersionDisplayTest < Minitest::Test
     about_module.open_about
 
     assert_includes UI.last_messagebox_text, 'ZB Smart Gizmo Pro'
-    assert_includes UI.last_messagebox_text, '1.5.3'
-    assert_match(/\AZB Smart Gizmo Pro 1\.5\.3\b/, UI.last_messagebox_text,
+    assert_includes UI.last_messagebox_text, '1.5.4'
+    assert_match(/\AZB Smart Gizmo Pro 1\.5\.4\b/, UI.last_messagebox_text,
       'the version must appear on the first line, right after PLUGIN_NAME')
   end
 
   # A DEV build only ever changes PLUGIN_VERSION (never PLUGIN_NAME) --
-  # confirms the exact "ZB Smart Gizmo Pro 1.5.3 DEV" wording a DEV package
+  # confirms the exact "ZB Smart Gizmo Pro 1.5.4 DEV" wording a DEV package
   # produces, built purely from the two constants.
   def test_about_shows_a_dev_labelled_version_when_plugin_version_carries_one
-    about_module(version: '1.5.3 DEV').open_about
+    about_module(version: '1.5.4 DEV').open_about
 
-    assert_equal "ZB Smart Gizmo Pro 1.5.3 DEV\n\nDeveloper: Peter Zbel\nWebsite: www.zbellbound.com",
+    assert_equal "ZB Smart Gizmo Pro 1.5.4 DEV\n\nDeveloper: Peter Zbel\nWebsite: www.zbellbound.com",
       UI.last_messagebox_text
   end
 
   def test_about_shows_the_plain_production_version_with_no_dev_wording
-    about_module(version: '1.5.3').open_about
+    about_module(version: '1.5.4').open_about
 
-    assert_equal "ZB Smart Gizmo Pro 1.5.3\n\nDeveloper: Peter Zbel\nWebsite: www.zbellbound.com",
+    assert_equal "ZB Smart Gizmo Pro 1.5.4\n\nDeveloper: Peter Zbel\nWebsite: www.zbellbound.com",
       UI.last_messagebox_text
     refute_match(/DEV/, UI.last_messagebox_text)
   end
@@ -117,13 +117,25 @@ class AboutVersionDisplayTest < Minitest::Test
   # -- 6. About shows the correct version after a version change ------------
 
   def test_about_text_tracks_a_changed_plugin_version
-    about_module(version: '1.5.2').open_about
-    assert_includes UI.last_messagebox_text, 'ZB Smart Gizmo Pro 1.5.2'
-
-    UI.last_messagebox_text = nil
     about_module(version: '1.5.3').open_about
     assert_includes UI.last_messagebox_text, 'ZB Smart Gizmo Pro 1.5.3'
-    refute_includes UI.last_messagebox_text, '1.5.2'
+
+    UI.last_messagebox_text = nil
+    about_module(version: '1.5.4').open_about
+    assert_includes UI.last_messagebox_text, 'ZB Smart Gizmo Pro 1.5.4'
+    refute_includes UI.last_messagebox_text, '1.5.3'
+  end
+
+  # -- 7. The production version --------------------------------------------
+
+  def test_the_production_version_is_exactly_1_5_4_with_no_build_label
+    source = File.read(File.expand_path('../zb_smart_gizmo_pro.rb', __dir__))
+    assigned = source.scan(/^\s*PLUGIN_VERSION\s*=\s*'([^']+)'\.freeze\s*$/).flatten
+
+    assert_equal ['1.5.4'], assigned, 'PLUGIN_VERSION is assigned exactly once, to exactly 1.5.4'
+    assert_match(/\A\d+\.\d+\.\d+\z/, assigned.first, 'a production version carries no DEV/RC label')
+    assert_operator Gem::Version.new(assigned.first), :>, Gem::Version.new('1.5.3')
+    assert_match(/extension\.version\s*=\s*PLUGIN_VERSION/, source, 'the extension registers this exact version')
   end
 
   # -- Preserves Developer/Website info; single dialog, no functional change -
