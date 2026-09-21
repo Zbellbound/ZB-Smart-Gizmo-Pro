@@ -18,6 +18,9 @@ EW.lic
 # signature can ever be committed or shipped.
 *.lic
 
+# Local DEV / live-test packages -- never committed as production artifacts
+Test Builds/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
