@@ -101,6 +101,22 @@ module Geom
     def to_a
       [x, y, z]
     end
+
+    # Real Geom::Vector3d#transform applies only the LINEAR (3x3) part of
+    # the transformation -- translation is meaningless for a direction --
+    # unlike Point3d#transform below (transform_point), which is a full
+    # affine transform including translation and the homogeneous divide.
+    # Reads the raw matrix directly (not the normalized xaxis/yaxis/zaxis
+    # accessors), so a scaled transformation's magnitude is preserved --
+    # needed for custom_orientation.rb's non-uniform-scale handling.
+    def transform(transformation)
+      m = transformation.m
+      Vector3d.new(
+        (m[0] * x) + (m[1] * y) + (m[2] * z),
+        (m[4] * x) + (m[5] * y) + (m[6] * z),
+        (m[8] * x) + (m[9] * y) + (m[10] * z)
+      )
+    end
   end
 
   class Point3d
@@ -720,6 +736,10 @@ module Sketchup
       @data.keys
     end
 
+    def delete(key)
+      @data.delete(key)
+    end
+
     def to_h
       @data.dup
     end
@@ -785,6 +805,22 @@ module Sketchup
 
       value = dict[key]
       value.nil? ? default_value : value
+    end
+
+    # Real Sketchup::Entity#delete_attribute(dict_name, key = nil): with no
+    # key, removes the WHOLE named dictionary; with a key, removes only
+    # that one attribute from it. Returns whatever was removed (an
+    # AttributeDictionary or a value), or nil if there was nothing to
+    # remove -- callers here only ever use it for its side effect.
+    def delete_attribute(dict_name, key = nil)
+      dict = @attribute_dictionaries[dict_name]
+      return nil unless dict
+
+      if key.nil?
+        @attribute_dictionaries.delete(dict_name)
+      else
+        dict.delete(key)
+      end
     end
 
     # Test-only convenience: bulk-load a whole dictionary from a plain
@@ -870,6 +906,7 @@ module Sketchup
   # duplication primitive for loose geometry.
   class Edge < Drawingelement
     attr_accessor :curve
+    attr_reader :start, :end
 
     def initialize(p1, p2)
       super()
@@ -890,7 +927,31 @@ module Sketchup
     end
   end
 
+  # Real Sketchup::Loop; only #edges is needed anywhere in this codebase
+  # (Face#outer_loop.edges, the custom-gizmo-orientation face-align path).
+  class Loop
+    attr_reader :edges
+
+    def initialize(edges)
+      @edges = edges
+    end
+  end
+
+  # Real Sketchup::Face#normal is documented to return the face's normal in
+  # its OWN local coordinate system (the same space its edges/vertices live
+  # in) -- exactly what this stub's constructor takes, since the real value
+  # is a genuine 3D computation from the face's loop that no test here needs
+  # to reimplement; fixtures just assert whatever normal they built the face
+  # with.
   class Face < Drawingelement
+    attr_accessor :normal
+    attr_reader :outer_loop
+
+    def initialize(outer_loop_edges, normal)
+      super()
+      @outer_loop = Loop.new(outer_loop_edges)
+      @normal = normal
+    end
   end
 
   class Entities

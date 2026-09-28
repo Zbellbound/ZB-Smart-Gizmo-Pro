@@ -799,7 +799,12 @@ module Zbellbound::SmartGizmoPro
         object = @selection[0]
         tr = object.transformation
         bb = object.definition.bounds
-        axes = [tr.origin, tr.xaxis, tr.yaxis, tr.zaxis]
+        custom_axes = CustomOrientation.world_axes_for(object)
+        axes = if custom_axes
+          [tr.origin, *custom_axes]
+        else
+          [tr.origin, tr.xaxis, tr.yaxis, tr.zaxis]
+        end
       else
 
         bb = Geom::BoundingBox.new
@@ -923,6 +928,179 @@ module Zbellbound::SmartGizmoPro
       return unless selected_one_object?
 
       set_custom_origin(@selection[0].transformation.origin)
+    end
+
+    # -- Custom gizmo orientation (Align Gizmo XY to Face / X to Edge / Reset) -
+
+    # Pushes a small picker Tool (see OrientationPickerTool below) that
+    # collects one face or edge click belonging to the selected instance,
+    # without entering its edit context, then pops itself. This method only
+    # ever runs from the gizmo's own context menu, already gated by
+    # license_permits_interaction? at the call site; the actual attribute
+    # write is gated again, freshly, in commit_custom_orientation, since an
+    # arbitrarily long time may pass before the user completes the pick.
+    def start_orientation_picker(mode)
+      return unless selected_one_object?
+
+      entity = @selection[0]
+      instruction = if mode == :face
+        "Click a face on the selected object to align the gizmo. Press Esc to cancel."
+      else
+        "Click a straight edge on the selected object to set gizmo X. Press Esc to cancel."
+      end
+      Sketchup.set_status_text(instruction)
+      @model.tools.push_tool(OrientationPickerTool.new(self, mode, entity))
+    end
+
+    # Removes only the stored custom orientation (native axes and geometry
+    # are never touched). A no-op -- no Undo entry -- when nothing is stored.
+    def reset_gizmo_orientation
+      return unless selected_one_object?
+
+      entity = @selection[0]
+      return unless CustomOrientation.stored?(entity)
+      return unless start_licensed_operation('Reset Gizmo Orientation')
+
+      CustomOrientation.reset!(entity)
+      @model.commit_operation
+      update_gizmo
+      @model.active_view.invalidate
+    end
+
+    # Called by OrientationPickerTool once it has already confirmed the pick
+    # is a Face belonging to `entity` (path.last), never entering edit mode
+    # to get it. `hit_position` is the world-space point raytest returned,
+    # used only to choose the nearest straight boundary edge for the initial
+    # X direction.
+    def apply_face_alignment(entity, path, hit_position)
+      face = path.last
+      world_transform = path_world_transform(path)
+      world_z = safe_face_normal(face, world_transform)
+      return false unless world_z
+
+      edge = closest_boundary_edge(face, world_transform, hit_position)
+      world_x = edge && edge_world_direction(edge, world_transform)
+      world_x = world_x && CustomOrientation.orthogonalize(world_x, world_z)
+      # No straight boundary edge (e.g. a fully circular face) or one that
+      # happened to come out ~parallel to the normal (degenerate geometry):
+      # a deterministic fallback still produces a valid, usable basis.
+      world_x ||= CustomOrientation.arbitrary_perpendicular(world_z)
+
+      commit_custom_orientation(entity, world_x, world_z, 'Align Gizmo to Face')
+    end
+
+    # Called by OrientationPickerTool once it has already confirmed the pick
+    # is a straight Edge (a single segment, even if part of a curve) belonging
+    # to `entity`. Preserves whichever Z the gizmo is currently showing --
+    # the custom one if already aligned, otherwise the entity's native Z --
+    # and only ever changes X (and, consequently, Y).
+    def apply_edge_alignment(entity, path)
+      edge = path.last
+      world_transform = path_world_transform(path)
+      world_edge = edge_world_direction(edge, world_transform)
+      return false unless world_edge
+
+      world_z = current_gizmo_z_direction(entity)
+      world_x = CustomOrientation.orthogonalize(world_edge, world_z)
+      unless world_x
+        UI.messagebox("That edge is nearly parallel to the gizmo's current Z axis and can't be used for X.")
+        return false
+      end
+
+      commit_custom_orientation(entity, world_x, world_z, 'Align Gizmo to Edge')
+    end
+
+    # The one Undo-wrapped write shared by both alignment commands: a fresh
+    # license check (start_licensed_operation), the attribute write, then an
+    # immediate gizmo refresh. Automatically switches to Object orientation,
+    # per the "Align Gizmo XY to Face" requirement -- harmless to also do
+    # this for edge-align, since a custom orientation is only ever consulted
+    # in Object mode in the first place (see gizmo_state_for_current_selection).
+    def commit_custom_orientation(entity, world_x, world_z, operation_name)
+      return false unless start_licensed_operation(operation_name)
+
+      unless CustomOrientation.store!(entity, world_x, world_z)
+        @model.abort_operation
+        UI.messagebox('Could not align the gizmo to that geometry.')
+        return false
+      end
+
+      PLUGIN.gizmo_orientation = LOCAL_ORIENTATION unless PLUGIN.gizmo_orientation == LOCAL_ORIENTATION
+      @model.commit_operation
+      update_gizmo
+      @model.active_view.invalidate
+      true
+    end
+
+    # The world-space Z the gizmo is CURRENTLY showing for `entity`: the
+    # custom Z if one is already stored, otherwise the entity's native Z.
+    # "Align Gizmo X to Edge" preserves whichever this is -- it does not
+    # require a face to have been aligned first.
+    def current_gizmo_z_direction(entity)
+      custom = CustomOrientation.world_axes_for(entity)
+      return custom[2] if custom
+
+      entity.transformation.zaxis
+    end
+
+    # Product of the transformations of every entity in `path` EXCEPT the
+    # last (the picked Face/Edge itself) -- maps the leaf's own local
+    # coordinates into world space, the standard way to interpret a
+    # Sketchup::Model#raytest path.
+    def path_world_transform(path)
+      path[0...-1].reduce(IDENTITY) { |acc, step| acc * step.transformation }
+    end
+
+    def edge_world_direction(edge, world_transform)
+      local = edge.start.position.vector_to(edge.end.position)
+      return nil if local.length < CustomOrientation::MIN_LENGTH
+
+      CustomOrientation.safe_transform(local, world_transform)
+    end
+
+    # Transforming a normal vector correctly under non-uniform scale is a
+    # separate (inverse-transpose) computation from an ordinary vector
+    # transform, but the path between a picked face and the selected
+    # instance is a plain nested-group/component chain in the overwhelming
+    # majority of real models (rotation/translation, at most uniform scale)
+    # -- for that common case a plain transform is exact, and
+    # CustomOrientation's own reconstruction re-orthonormalizes on every
+    # read regardless, so a non-uniform-scale edge case here degrades to "a
+    # still-valid, still right-handed, merely not perfectly-perpendicular
+    # basis" rather than a crash or a broken gizmo.
+    def safe_face_normal(face, world_transform)
+      CustomOrientation.safe_transform(face.normal, world_transform)
+    end
+
+    # The edge on face's outer boundary nearest hit_position (world-space
+    # distance from the pick point to the closest point on each candidate
+    # segment). Every Edge -- including one flagged as part of a Curve/
+    # ArcCurve for a circle or a polyline -- is itself a single straight
+    # chord between two vertices, so none are excluded here: a circular
+    # face's boundary is internally many short straight Edge segments, and
+    # picking whichever is closest to the click gives a locally-relevant,
+    # deterministic X direction just as well as it does for a polygon face.
+    # nil only if the face's outer loop genuinely has no edges at all, in
+    # which case the caller falls back to
+    # CustomOrientation.arbitrary_perpendicular.
+    def closest_boundary_edge(face, world_transform, hit_position)
+      candidates = face.outer_loop.edges
+      return nil if candidates.empty?
+
+      candidates.min_by do |edge|
+        a = edge.start.position.transform(world_transform)
+        b = edge.end.position.transform(world_transform)
+        closest_point_on_segment(hit_position, a, b).distance(hit_position)
+      end
+    end
+
+    def closest_point_on_segment(point, a, b)
+      segment = a.vector_to(b)
+      length_squared = segment.length**2
+      return a if length_squared < CustomOrientation::MIN_LENGTH
+
+      t = (a.vector_to(point).dot(segment) / length_squared).clamp(0.0, 1.0)
+      Geom::Point3d.new(a.x + (segment.x * t), a.y + (segment.y * t), a.z + (segment.z * t))
     end
 
     def selected_entities
@@ -2638,9 +2816,32 @@ module Zbellbound::SmartGizmoPro
 
     def smart_scale_root_to_solver_transformation(entity, parent_root_to_solver = nil)
       return parent_root_to_solver * entity.transformation if parent_root_to_solver
-      return IDENTITY unless smart_scale_global_orientation?
+      return custom_orientation_solver_transformation(entity) unless smart_scale_global_orientation?
 
       smart_scale_solver_axes_transformation.inverse * entity.transformation
+    end
+
+    # When Object/local orientation is showing a custom gizmo basis (see
+    # custom_orientation.rb) instead of the entity's own native axes, Smart
+    # Scale's structural frame detection must operate in THAT basis too, or
+    # scaling along "gizmo X" (now a custom, face-aligned direction) would be
+    # read by the solver as if it were the entity's native local X. Uses
+    # local_axes_for (never world_axes_for): the solver works directly in the
+    # entity's raw local/definition space -- the same space
+    # transform_by_vectors mutates -- never through entity.transformation, so
+    # the custom basis must be expressed in that same untransformed space. A
+    # pure rotation (ORIGIN, no translation): only the entity's own local
+    # origin is meaningful here, unlike the global case's model-axes origin.
+    # Only the ROOT entity can have a custom orientation (see getMenu);
+    # nested children are unaffected and keep composing through
+    # entity.transformation as before (the branch above), so this is only
+    # ever reached with parent_root_to_solver nil.
+    def custom_orientation_solver_transformation(entity)
+      axes = CustomOrientation.local_axes_for(entity)
+      return IDENTITY unless axes
+
+      local_x, local_y, local_z = axes
+      Geom::Transformation.new(local_x, local_y, local_z, ORIGIN).inverse
     end
 
     def transform_root_point_to_solver(point, root_to_solver_transformation)
@@ -3184,6 +3385,12 @@ module Zbellbound::SmartGizmoPro
         end
         menu.set_validation_proc(cmd) { PLUGIN.gizmo_orientation == i ? MF_CHECKED : MF_UNCHECKED }
       end
+      if selected_one_object?
+        menu.add_separator
+        menu.add_item('Align Gizmo XY to Face...') { start_orientation_picker(:face) if license_permits_interaction? }
+        menu.add_item('Align Gizmo X to Edge...') { start_orientation_picker(:edge) if license_permits_interaction? }
+        menu.add_item('Reset Gizmo Orientation to Object Axes') { reset_gizmo_orientation if license_permits_interaction? }
+      end
       menu.add_separator
       menu.add_item('Reset Pivot To Selection Center') { set_pivot_to_selection_center if license_permits_interaction? }
       menu.add_item('Set Pivot To Model Axes Origin') { set_pivot_to_model_origin if license_permits_interaction? }
@@ -3557,6 +3764,81 @@ module Zbellbound::SmartGizmoPro
       module_name = self.class.name.split('::')[-2]
       hex_id = format('0x%x', (object_id << 1))
       "#<#{module_name}::#{name}:#{hex_id}>"
+    end
+  end
+
+  # A short-lived tool (plain object, no Sketchup::Tool superclass to
+  # inherit -- SketchUp tools are duck-typed) that collects exactly one face
+  # or edge click for "Align Gizmo XY to Face" / "Align Gizmo X to Edge",
+  # then pops itself: on a successful pick (handed off to the overlay's own
+  # apply_face_alignment/apply_edge_alignment, which does the actual
+  # licensed Undo-wrapped write), or on Esc (onCancel, reason 0 -- no Undo
+  # entry, nothing ever changed). A click that misses -- the wrong object,
+  # the wrong kind of leaf, or empty space -- simply leaves the picker
+  # active so the user can try again without reopening the menu; only Esc
+  # (or right-click, which SketchUp itself routes to onCancel/deactivate
+  # for a tool with no context menu of its own) actually cancels.
+  class OrientationPickerTool
+    def initialize(overlay, mode, entity)
+      @overlay = overlay
+      @mode = mode
+      @entity = entity
+    end
+
+    def activate
+      Sketchup.set_status_text(status_text)
+    end
+
+    def resume(_view)
+      Sketchup.set_status_text(status_text)
+    end
+
+    def status_text
+      if @mode == :face
+        'Click a face on the selected object to align the gizmo. Press Esc to cancel.'
+      else
+        'Click a straight edge on the selected object to set gizmo X. Press Esc to cancel.'
+      end
+    end
+
+    # A pushed tool that never opens its own start_operation; onCancel
+    # (reason 0 == the user pressed Escape) is SketchUp's own documented way
+    # to detect that here. Popping is enough -- nothing was ever changed, so
+    # there is nothing to undo.
+    def onCancel(_reason, view)
+      pop_self(view)
+    end
+
+    # Keeps the target instance closed: without this override, a native
+    # double-click default could enter its edit context out from under the
+    # picker.
+    def onLButtonDoubleClick(_flags, _x, _y, _view)
+      true
+    end
+
+    def onLButtonUp(_flags, x, y, view)
+      hit = view.model.raytest(view.pickray(x, y), false)
+      return unless hit
+
+      position, path = hit
+      return if path.nil? || path.empty?
+      return unless path.first == @entity
+
+      leaf = path.last
+      handled = if @mode == :face
+        leaf.is_a?(Sketchup::Face) && @overlay.apply_face_alignment(@entity, path, position)
+      else
+        leaf.is_a?(Sketchup::Edge) && @overlay.apply_edge_alignment(@entity, path)
+      end
+
+      pop_self(view) if handled
+    end
+
+    # Pops via the SAME model/view the callback was given, rather than the
+    # Sketchup.active_model global -- correct even if that global were ever
+    # to disagree with the document this picker is actually running in.
+    def pop_self(view)
+      view.model.tools.pop_tool
     end
   end
 end

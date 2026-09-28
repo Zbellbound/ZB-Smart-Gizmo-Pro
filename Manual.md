@@ -140,6 +140,41 @@ Smart Scale is a structure-aware alternative to normal SketchUp scale.
   `Set Pivot To Model Axes Origin`, and `Set Pivot To Object Origin` (only offered when exactly
   one group/component is selected).
 
+## Custom Gizmo Orientation
+
+Object orientation normally follows the selected Group or Component Instance's own
+axes -- the axes it happened to have at the moment it was grouped. If geometry was modeled at an
+angle and grouped afterward, those axes don't match the angle the geometry visibly sits at, and
+Object mode's Move/Rotate/Scale handles point along the group's original axes rather than along
+the visible faces and edges.
+
+Right-click the gizmo (with exactly one Group or Component Instance selected) for three commands
+that let the gizmo instead follow the visible geometry, without changing the object's real axes,
+its position, or its geometry in any way:
+
+- **Align Gizmo XY to Face...** -- click a face on the selected object. The gizmo's XY plane
+  aligns with that face and Z becomes perpendicular to it, using a boundary edge near where you
+  clicked as the initial X direction. Switches to Object orientation automatically.
+- **Align Gizmo X to Edge...** -- click a straight edge on the selected object. X aligns with that
+  edge; Z is left exactly as it was (from a previous face-align, or the object's own native Z if
+  none has been set yet).
+- **Reset Gizmo Orientation to Object Axes** -- removes the custom orientation and returns to the
+  object's normal native axes.
+
+The picker stays on the closed object -- it never opens it for editing -- and Esc cancels cleanly
+at any time. A custom orientation only applies in Object mode; Global orientation is unaffected.
+Setting, changing, or resetting it is one ordinary Undo step, and it is stored on the instance
+itself, so two instances of the same shared component can each have their own gizmo orientation,
+and a later move, rotate, or copy of the object carries its custom orientation along with it.
+
+**Example:** a box modeled at 45 degrees, then grouped. Selecting the group and switching to
+Object orientation shows Move/Scale handles running along the group's original (un-rotated) axes,
+not along the box's visible 45-degree faces. Right-click the gizmo, choose **Align Gizmo XY to
+Face...**, and click the box's top face -- the gizmo's XY plane and handles now follow the box's
+actual angle. Click **Align Gizmo X to Edge...** and click one of the box's side edges if you also
+want X pinned exactly to that edge rather than to whichever boundary edge happened to be picked
+automatically.
+
 ## Preferences
 
 Preferences are available from:
