@@ -356,6 +356,7 @@ class LicensingTest < Minitest::Test
       zb_smart_gizmo_pro/Resources/icon.pdf
       zb_smart_gizmo_pro/Resources/icon.png
       zb_smart_gizmo_pro/Resources/icon.svg
+      zb_smart_gizmo_pro/custom_orientation.rb
       zb_smart_gizmo_pro/gizmo.rb
       zb_smart_gizmo_pro/licensing.rb
       zb_smart_gizmo_pro/loader.rb

@@ -27,6 +27,14 @@ module Zbellbound
       test_gizmo_orientation
     end
 
+    # Real loader.rb's setter writes Sketchup.write_default; this test
+    # double just flips the same test_gizmo_orientation flag the getter
+    # above reads -- needed once commit_custom_orientation started writing
+    # this (auto-switch to Object orientation on a successful align).
+    def self.gizmo_orientation=(value)
+      self.test_gizmo_orientation = value
+    end
+
     def self.active_overlay(_model = nil)
       nil
     end
@@ -62,4 +70,5 @@ end
 root = File.expand_path('../../zb_smart_gizmo_pro', __dir__)
 require File.join(root, 'utils.rb')
 require File.join(root, 'licensing.rb')
+require File.join(root, 'custom_orientation.rb')
 require File.join(root, 'overlay.rb')

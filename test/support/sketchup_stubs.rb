@@ -101,6 +101,22 @@ module Geom
     def to_a
       [x, y, z]
     end
+
+    # Real Geom::Vector3d#transform applies only the LINEAR (3x3) part of
+    # the transformation -- translation is meaningless for a direction --
+    # unlike Point3d#transform below (transform_point), which is a full
+    # affine transform including translation and the homogeneous divide.
+    # Reads the raw matrix directly (not the normalized xaxis/yaxis/zaxis
+    # accessors), so a scaled transformation's magnitude is preserved --
+    # needed for custom_orientation.rb's non-uniform-scale handling.
+    def transform(transformation)
+      m = transformation.m
+      Vector3d.new(
+        (m[0] * x) + (m[1] * y) + (m[2] * z),
+        (m[4] * x) + (m[5] * y) + (m[6] * z),
+        (m[8] * x) + (m[9] * y) + (m[10] * z)
+      )
+    end
   end
 
   class Point3d
@@ -720,6 +736,10 @@ module Sketchup
       @data.keys
     end
 
+    def delete(key)
+      @data.delete(key)
+    end
+
     def to_h
       @data.dup
     end
@@ -785,6 +805,22 @@ module Sketchup
 
       value = dict[key]
       value.nil? ? default_value : value
+    end
+
+    # Real Sketchup::Entity#delete_attribute(dict_name, key = nil): with no
+    # key, removes the WHOLE named dictionary; with a key, removes only
+    # that one attribute from it. Returns whatever was removed (an
+    # AttributeDictionary or a value), or nil if there was nothing to
+    # remove -- callers here only ever use it for its side effect.
+    def delete_attribute(dict_name, key = nil)
+      dict = @attribute_dictionaries[dict_name]
+      return nil unless dict
+
+      if key.nil?
+        @attribute_dictionaries.delete(dict_name)
+      else
+        dict.delete(key)
+      end
     end
 
     # Test-only convenience: bulk-load a whole dictionary from a plain
@@ -870,6 +906,7 @@ module Sketchup
   # duplication primitive for loose geometry.
   class Edge < Drawingelement
     attr_accessor :curve
+    attr_reader :start, :end
 
     def initialize(p1, p2)
       super()
@@ -890,7 +927,31 @@ module Sketchup
     end
   end
 
+  # Real Sketchup::Loop; only #edges is needed anywhere in this codebase
+  # (Face#outer_loop.edges, the custom-gizmo-orientation face-align path).
+  class Loop
+    attr_reader :edges
+
+    def initialize(edges)
+      @edges = edges
+    end
+  end
+
+  # Real Sketchup::Face#normal is documented to return the face's normal in
+  # its OWN local coordinate system (the same space its edges/vertices live
+  # in) -- exactly what this stub's constructor takes, since the real value
+  # is a genuine 3D computation from the face's loop that no test here needs
+  # to reimplement; fixtures just assert whatever normal they built the face
+  # with.
   class Face < Drawingelement
+    attr_accessor :normal
+    attr_reader :outer_loop
+
+    def initialize(outer_loop_edges, normal)
+      super()
+      @outer_loop = Loop.new(outer_loop_edges)
+      @normal = normal
+    end
   end
 
   class Entities
@@ -1179,12 +1240,100 @@ module Sketchup
   end
 
   class View
+    attr_accessor :model
+    # Test-double-only call counter, so a spec can prove a repaint was
+    # actually requested (real Sketchup::View#invalidate has no return
+    # value or other observable effect to assert on instead).
+    attr_accessor :invalidate_count
+    # Test-double-only: a spec preconfigures this before driving a mouse
+    # event, and InputPoint#pick (below) resolves to it -- the same role
+    # FakePickModel's raytest hit played for the earlier face/edge picker,
+    # but scoped to the view so real Sketchup::View/InputPoint objects can
+    # be exercised instead of a one-off per-test fake.
+    attr_accessor :next_input_point
+
+    def initialize(model = nil)
+      @model = model
+      @invalidate_count = 0
+    end
+
     def invalidate
+      @invalidate_count += 1
       nil
     end
 
     def tooltip=(_value)
       nil
+    end
+  end
+
+  # Real Sketchup::InputPoint: the standard SketchUp tool-authoring pattern
+  # for point-picking with real vertex/edge/midpoint inference, on-screen
+  # markers (#draw) and tooltips (#tooltip) -- used here instead of a plain
+  # Model#raytest so "Set Gizmo Orientation by 3 Points" gets real snapping.
+  # #pick resolves from the view's preconfigured `next_input_point` (a Hash
+  # with :position, :instance_path, and optionally :valid/:tooltip), since
+  # simulating SketchUp's real inference engine is out of scope for this
+  # test double.
+  class InputPoint
+    attr_reader :position, :instance_path
+
+    def initialize
+      @position = nil
+      @instance_path = nil
+      @valid = false
+      @tooltip = ''
+    end
+
+    def pick(view, _x, _y, _second_point = nil)
+      resolved = view.respond_to?(:next_input_point) ? view.next_input_point : nil
+      if resolved
+        @position = resolved[:position]
+        @instance_path = resolved[:instance_path]
+        @valid = resolved.fetch(:valid, true)
+        @tooltip = resolved.fetch(:tooltip, '')
+      else
+        @position = nil
+        @instance_path = nil
+        @valid = false
+        @tooltip = ''
+      end
+      self
+    end
+
+    def valid?
+      @valid
+    end
+
+    def tooltip
+      @tooltip
+    end
+
+    def draw(_view)
+      nil
+    end
+  end
+
+  # Real Sketchup::Model#tools (Sketchup::Tools): the active-tool stack a
+  # pushed Tool sits on. Modeled here only as a plain array-backed stack --
+  # enough for production code that pushes/pops its own tools (the
+  # orientation picker) to be exercised with a real Sketchup::Model rather
+  # than a one-off per-test fake.
+  class Tools
+    def initialize
+      @stack = []
+    end
+
+    def push_tool(tool)
+      @stack.push(tool)
+    end
+
+    def pop_tool
+      @stack.pop
+    end
+
+    def active_tool
+      @stack.last
     end
   end
 
@@ -1212,12 +1361,21 @@ module Sketchup
 
   class Model
     attr_accessor :selection
-    attr_reader :operation_log
+    attr_reader :operation_log, :tools
 
     def initialize
       @selection = Selection.new
-      @view = View.new
+      @view = View.new(self)
       @operation_log = []
+      @tools = Tools.new
+    end
+
+    # Real Sketchup::Model#valid? is false once the model/document has been
+    # closed. No test-double model is ever "closed", so always true here --
+    # existing production guards like `@model&.valid?` still need this to
+    # respond rather than raise.
+    def valid?
+      true
     end
 
     def axes
@@ -1323,6 +1481,18 @@ module Sketchup
     self.last_vcb_value = value
   end
   def self.send_action(_action); end
+
+  # Real Sketchup.set_status_text(text, sb = SB_PROMPT) sets the status bar
+  # prompt; recorded here purely so a spec can assert a picker actually
+  # updated its prompt between stages.
+  class << self
+    attr_accessor :last_status_text
+  end
+
+  def self.set_status_text(text, _sb = nil)
+    self.last_status_text = text
+    nil
+  end
 
   # Real Sketchup.format_length(number, precision = nil): "formats a
   # number as a length using the current units settings" (confirmed
