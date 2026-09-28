@@ -170,6 +170,8 @@ class CustomGizmoOrientationTest < Minitest::Test
     P::PLUGIN.test_smart_scale_enabled = false
     P::PLUGIN.test_gizmo_orientation = P::GLOBAL_ORIENTATION
     UI.last_messagebox_text = nil
+    UI.started_timers = []
+    UI.timer_blocks = []
     L.reset!
   end
 
@@ -335,6 +337,155 @@ class CustomGizmoOrientationTest < Minitest::Test
     refute CO.stored?(g)
     assert_equal 'v', g.get_attribute('SomeOtherExtension', 'k')
     assert_equal %i[start commit start commit], @model.operation_log.map(&:first)
+  end
+
+  # -- Picker completion: finish_orientation_picker / deferred restore -----
+  #
+  # Regression coverage for the bug where the gizmo stayed hidden after a
+  # successful face/edge pick until the user made one extra click. Root
+  # cause: SketchUp delivers the ToolsObserver#onActiveToolChanged
+  # notification that clears @native_tool_override asynchronously, not
+  # synchronously inside pop_tool -- so recomputing gizmo visibility right
+  # after popping the picker tool could still see it as hidden.
+  # finish_orientation_picker always pops the tool immediately but defers
+  # the actual restore to a zero-delay UI.start_timer (UI.timer_blocks in
+  # this test double), by which point that notification, if any, has
+  # already been delivered.
+
+  def push_fake_picker(overlay, entity, mode = :face)
+    tool = P::OrientationPickerTool.new(overlay, mode, entity)
+    @model.tools.push_tool(tool)
+    tool
+  end
+
+  def test_a_successful_face_pick_exits_the_picker_and_schedules_a_gizmo_restore
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.enabled = true
+    push_fake_picker(overlay, g, :face)
+    overlay.instance_variable_set(:@native_tool_override, true)
+    face, p0, p1, = build_diamond_top_face
+
+    assert overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    overlay.finish_orientation_picker(@model.active_view)
+
+    assert_nil @model.tools.active_tool, 'the picker tool must be popped immediately, not deferred'
+    assert overlay.instance_variable_get(:@native_tool_override), 'the actual restore is deferred, not inline'
+    assert_equal 1, UI.timer_blocks.length, 'exactly one deferred restore is scheduled'
+
+    UI.timer_blocks.last.call
+
+    refute overlay.instance_variable_get(:@native_tool_override), 'the deferred restore clears the override'
+    assert overlay.active_gizmo, 'the gizmo must be visible again without any further click'
+  end
+
+  def test_a_successful_edge_pick_exits_the_picker_and_schedules_a_gizmo_restore
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.enabled = true
+    push_fake_picker(overlay, g, :edge)
+    overlay.instance_variable_set(:@native_tool_override, true)
+    edge = Sketchup::Edge.new(Geom::Point3d.new(0, 0, 0), Geom::Point3d.new(1, 0, 0))
+
+    assert overlay.apply_edge_alignment(g, [g, edge])
+    overlay.finish_orientation_picker(@model.active_view)
+
+    assert_nil @model.tools.active_tool
+    assert_equal 1, UI.timer_blocks.length
+
+    UI.timer_blocks.last.call
+
+    refute overlay.instance_variable_get(:@native_tool_override)
+    assert overlay.active_gizmo
+  end
+
+  def test_the_selected_object_remains_selected_through_the_whole_picker_flow
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    push_fake_picker(overlay, g, :face)
+    face, p0, p1, = build_diamond_top_face
+
+    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    overlay.finish_orientation_picker(@model.active_view)
+    UI.timer_blocks.last.call
+
+    assert_equal [g], @model.selection.to_a, 'the picker flow must never change the selection'
+  end
+
+  def test_esc_restores_the_gizmo_immediately_without_changing_orientation_or_undo
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.enabled = true
+    tool = push_fake_picker(overlay, g, :face)
+    overlay.instance_variable_set(:@native_tool_override, true)
+    refute CO.stored?(g)
+
+    tool.onCancel(0, @model.active_view)
+
+    assert_nil @model.tools.active_tool, 'Esc must pop the picker immediately'
+    assert_empty @model.operation_log, 'Esc must never open an Undo operation'
+    assert overlay.instance_variable_get(:@native_tool_override), 'the restore is still deferred at this point'
+
+    UI.timer_blocks.last.call
+
+    refute CO.stored?(g), 'Esc must not create a custom orientation'
+    refute overlay.instance_variable_get(:@native_tool_override), 'Esc must restore the gizmo without a further click'
+    assert overlay.active_gizmo
+  end
+
+  def test_finishing_the_picker_never_opens_an_additional_undo_operation
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    push_fake_picker(overlay, g, :face)
+    face, p0, p1, = build_diamond_top_face
+
+    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    log_after_align = @model.operation_log.dup
+
+    overlay.finish_orientation_picker(@model.active_view)
+    UI.timer_blocks.last.call
+
+    assert_equal log_after_align, @model.operation_log,
+      'popping the picker and restoring the gizmo must never start a second Undo operation'
+  end
+
+  def test_a_stale_deferred_restore_is_ignored_and_only_the_latest_one_applies
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    push_fake_picker(overlay, g, :face)
+    overlay.instance_variable_set(:@native_tool_override, true)
+
+    overlay.finish_orientation_picker(@model.active_view)
+    stale_block = UI.timer_blocks.last
+
+    push_fake_picker(overlay, g, :face)
+    overlay.instance_variable_set(:@native_tool_override, true)
+    overlay.finish_orientation_picker(@model.active_view)
+    fresh_block = UI.timer_blocks.last
+    refute_same stale_block, fresh_block
+
+    stale_block.call
+    assert overlay.instance_variable_get(:@native_tool_override), 'a superseded restore must be a no-op'
+
+    fresh_block.call
+    refute overlay.instance_variable_get(:@native_tool_override), 'the latest scheduled restore still applies'
+  end
+
+  def test_a_deferred_restore_is_ignored_once_the_overlay_has_moved_to_another_model
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    original_model = @model
+    push_fake_picker(overlay, g, :face)
+    overlay.instance_variable_set(:@native_tool_override, true)
+
+    overlay.finish_orientation_picker(original_model.active_view)
+    block = UI.timer_blocks.last
+
+    overlay.instance_variable_set(:@model, Sketchup::Model.new)
+
+    block.call
+    assert overlay.instance_variable_get(:@native_tool_override),
+      'a restore scheduled for a since-abandoned model must not fire against the new one'
   end
 
   # -- gizmo_state_for_current_selection / Global-mode isolation -----------
@@ -526,6 +677,13 @@ class OrientationPickerToolTest < Minitest::Test
     overlay = Object.new
     overlay.define_singleton_method(:apply_face_alignment) { |*a| calls << [:face, *a]; true }
     overlay.define_singleton_method(:apply_edge_alignment) { |*a| calls << [:edge, *a]; true }
+    # The real GizmoOverlay#finish_orientation_picker pops the tool itself
+    # (see the production method) -- reproduced minimally here so this
+    # spy still exercises exactly what OrientationPickerTool is required to
+    # call on every exit path (success or Esc), without pulling in the real
+    # overlay's deferred-refresh machinery, which is covered separately
+    # against the real GizmoOverlay below.
+    overlay.define_singleton_method(:finish_orientation_picker) { |view| view.model.tools.pop_tool }
     [overlay, calls]
   end
 

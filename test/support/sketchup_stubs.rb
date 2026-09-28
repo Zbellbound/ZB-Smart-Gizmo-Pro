@@ -1240,12 +1240,41 @@ module Sketchup
   end
 
   class View
+    attr_accessor :model
+
+    def initialize(model = nil)
+      @model = model
+    end
+
     def invalidate
       nil
     end
 
     def tooltip=(_value)
       nil
+    end
+  end
+
+  # Real Sketchup::Model#tools (Sketchup::Tools): the active-tool stack a
+  # pushed Tool sits on. Modeled here only as a plain array-backed stack --
+  # enough for production code that pushes/pops its own tools (the
+  # orientation picker) to be exercised with a real Sketchup::Model rather
+  # than a one-off per-test fake.
+  class Tools
+    def initialize
+      @stack = []
+    end
+
+    def push_tool(tool)
+      @stack.push(tool)
+    end
+
+    def pop_tool
+      @stack.pop
+    end
+
+    def active_tool
+      @stack.last
     end
   end
 
@@ -1273,12 +1302,21 @@ module Sketchup
 
   class Model
     attr_accessor :selection
-    attr_reader :operation_log
+    attr_reader :operation_log, :tools
 
     def initialize
       @selection = Selection.new
-      @view = View.new
+      @view = View.new(self)
       @operation_log = []
+      @tools = Tools.new
+    end
+
+    # Real Sketchup::Model#valid? is false once the model/document has been
+    # closed. No test-double model is ever "closed", so always true here --
+    # existing production guards like `@model&.valid?` still need this to
+    # respond rather than raise.
+    def valid?
+      true
     end
 
     def axes

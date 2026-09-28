@@ -952,6 +952,48 @@ module Zbellbound::SmartGizmoPro
       @model.tools.push_tool(OrientationPickerTool.new(self, mode, entity))
     end
 
+    # The one completion path for OrientationPickerTool, shared by a
+    # successful face alignment, a successful edge alignment, and Esc
+    # cancellation alike -- whichever happened (or didn't) has already been
+    # decided by the caller before this runs. Popping the tool here is not
+    # enough by itself to make the gizmo reappear: SketchUp delivers the
+    # ToolsObserver#onActiveToolChanged notification that clears
+    # @native_tool_override asynchronously, not synchronously inside
+    # pop_tool, so drawing (or even just recomputing active_gizmo) right
+    # here can still be gated off by a @native_tool_override that hasn't
+    # been cleared yet -- that's the extra click the user had to make.
+    # Forcing the restored state directly, on a deferred zero-delay timer,
+    # fixes both problems: it no longer depends on that notification's
+    # timing, and it still runs on the next tick rather than inline.
+    def finish_orientation_picker(view)
+      model = view.model
+      model.tools.pop_tool
+      schedule_orientation_picker_restore(model)
+    end
+
+    # Guarded by a token (only the most recently scheduled restore may run)
+    # and, when it fires, by the model and selection generation captured at
+    # schedule time -- so a restore left over from an earlier pick can never
+    # touch a model that's since been closed, a different document, or a
+    # selection that's since changed.
+    def schedule_orientation_picker_restore(model)
+      token = (@orientation_picker_token || 0) + 1
+      @orientation_picker_token = token
+      generation = @refresh_generation
+
+      UI.start_timer(0, false) do
+        next if token != @orientation_picker_token
+        next unless model && model == @model && model.valid?
+        next unless generation == @refresh_generation
+
+        @native_tool_override = false
+        @current_tool_name = nil
+        self.active_gizmo = enabled? && selection_present?
+        update_gizmo
+        model.active_view.invalidate
+      end
+    end
+
     # Removes only the stored custom orientation (native axes and geometry
     # are never touched). A no-op -- no Undo entry -- when nothing is stored.
     def reset_gizmo_orientation
@@ -3803,10 +3845,11 @@ module Zbellbound::SmartGizmoPro
 
     # A pushed tool that never opens its own start_operation; onCancel
     # (reason 0 == the user pressed Escape) is SketchUp's own documented way
-    # to detect that here. Popping is enough -- nothing was ever changed, so
-    # there is nothing to undo.
+    # to detect that here. Nothing was ever changed, so there is nothing to
+    # undo -- finish_orientation_picker only pops the tool and restores the
+    # gizmo's visibility, exactly as it does for a successful pick.
     def onCancel(_reason, view)
-      pop_self(view)
+      @overlay.finish_orientation_picker(view)
     end
 
     # Keeps the target instance closed: without this override, a native
@@ -3831,14 +3874,7 @@ module Zbellbound::SmartGizmoPro
         leaf.is_a?(Sketchup::Edge) && @overlay.apply_edge_alignment(@entity, path)
       end
 
-      pop_self(view) if handled
-    end
-
-    # Pops via the SAME model/view the callback was given, rather than the
-    # Sketchup.active_model global -- correct even if that global were ever
-    # to disagree with the document this picker is actually running in.
-    def pop_self(view)
-      view.model.tools.pop_tool
+      @overlay.finish_orientation_picker(view) if handled
     end
   end
 end
