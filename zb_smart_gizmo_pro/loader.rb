@@ -516,17 +516,18 @@ module Zbellbound
                 <div class="card">
                   <h3>Right-Click Menu</h3>
                   <ul>
-                    <li><code>Align Gizmo XY to Face...</code> -- click a face on the selected object; XY aligns to it, Z becomes perpendicular, and Object orientation switches on automatically.</li>
-                    <li><code>Align Gizmo X to Edge...</code> -- click a straight edge; X aligns to it, current Z is preserved.</li>
+                    <li><code>Set Gizmo Orientation by 3 Points...</code> -- click origin, then positive X, then a point on the positive-Y side; Object orientation switches on automatically once all three are picked.</li>
+                    <li>Point 2 can't coincide with point 1, and point 3 can't be collinear with points 1 and 2 -- either is rejected with a short message so you can just click again.</li>
+                    <li>Backspace steps back one picked point; Esc cancels the whole operation with no change to the model.</li>
                     <li><code>Reset Gizmo Orientation to Object Axes</code> -- removes the custom orientation.</li>
-                    <li>The object stays closed throughout -- picking a face or edge never opens it for editing. Esc cancels cleanly.</li>
+                    <li>The object stays closed throughout -- picking never opens it for editing, and normal SketchUp inference (vertices, edges, midpoints) is available for every click.</li>
                   </ul>
                 </div>
                 <div class="card">
                   <h3>Example</h3>
                   <ul>
                     <li>A box modeled at 45 degrees, then grouped: Object orientation's handles run along the group's original axes, not the box's visible 45-degree faces.</li>
-                    <li>Right-click the gizmo, choose <code>Align Gizmo XY to Face...</code>, and click the box's top face -- the gizmo now follows the box's actual angle.</li>
+                    <li>Right-click the gizmo, choose <code>Set Gizmo Orientation by 3 Points...</code>, then click a top-face corner (origin), an adjacent corner (positive X), and a corner on the far side of that edge (positive Y side) -- the gizmo now follows the box's actual angle.</li>
                     <li>Applies only in Object mode; Global orientation is unaffected. Stored per instance, so a shared component's other instances are untouched, and it follows the object if later moved, rotated, or copied.</li>
                   </ul>
                 </div>

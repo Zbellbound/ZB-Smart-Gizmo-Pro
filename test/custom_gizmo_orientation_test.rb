@@ -1,25 +1,26 @@
 require 'minitest/autorun'
 require_relative 'support/fixtures'
 
-# Coverage for custom per-instance gizmo orientation ("Align Gizmo XY to
-# Face" / "Align Gizmo X to Edge" / "Reset Gizmo Orientation to Object
-# Axes"): geometry modeled at an angle and grouped afterward keeps the
-# axes it happened to have at grouping time, not the angle it visibly
-# sits at -- these commands let the gizmo instead follow the visible
-# geometry, without changing the object's real axes, transformation, or
-# geometry.
+# Coverage for custom per-instance gizmo orientation ("Set Gizmo Orientation
+# by 3 Points" / "Reset Gizmo Orientation to Object Axes"): geometry modeled
+# at an angle and grouped afterward keeps the axes it happened to have at
+# grouping time, not the angle it visibly sits at -- these commands let the
+# gizmo instead follow the visible geometry, without changing the object's
+# real axes, transformation, or geometry.
 #
 # Two layers, matching custom_orientation.rb's own split:
 # * CustomOrientationTest drives Zbellbound::SmartGizmoPro::CustomOrientation
 #   directly (storage, reconstruction, per-instance isolation,
 #   transformation-following, mirrored/non-uniform scale) -- pure Geom/
 #   attribute-dictionary math, no overlay or picking involved.
-# * CustomGizmoOrientationTest drives the real GizmoOverlay methods
-#   (apply_face_alignment/apply_edge_alignment/reset_gizmo_orientation/
-#   gizmo_state_for_current_selection) and the real OrientationPickerTool,
-#   the same way the rest of this suite drives GizmoOverlay's other
-#   context-menu actions and gestures directly rather than simulating real
-#   mouse events end to end.
+# * CustomGizmoOrientationTest drives the real GizmoOverlay picker methods
+#   (start_point_orientation_picker/complete_point_orientation/
+#   reset_gizmo_orientation/gizmo_state_for_current_selection) through its
+#   real onMouseMove/onLButtonDown/onLButtonUp/onKeyDown callbacks, using a
+#   simulated Sketchup::InputPoint (see test/support/sketchup_stubs.rb)
+#   instead of a real inference engine -- the picker never pushes a
+#   separate Tool, so this exercises the exact same overlay a live SketchUp
+#   session would drive.
 class CustomOrientationTest < Minitest::Test
   P = Zbellbound::SmartGizmoPro
   CO = Zbellbound::SmartGizmoPro::CustomOrientation
@@ -185,67 +186,77 @@ class CustomGizmoOrientationTest < Minitest::Test
 
   def build_overlay_with(entity)
     select(entity)
-    TestHarness.build_overlay(model: @model, selection: @model.selection)
-  end
-
-  # A square, planar face in LOCAL space, normal +Z, whose boundary runs at
-  # 45 degrees to the group's own local X/Y axes -- exactly the "modeled at
-  # an angle, then grouped" scenario this whole feature targets, so a
-  # correct alignment is visibly different from the object's native axes
-  # even when the group's own transformation is plain (untranslated,
-  # unrotated).
-  def build_diamond_top_face
-    d = 10 * Math.sqrt(0.5)
-    p0 = Geom::Point3d.new(0, 0, 5)
-    p1 = Geom::Point3d.new(d, d, 5)
-    p2 = Geom::Point3d.new(0, 2 * d, 5)
-    p3 = Geom::Point3d.new(-d, d, 5)
-    edges = [Sketchup::Edge.new(p0, p1), Sketchup::Edge.new(p1, p2),
-             Sketchup::Edge.new(p2, p3), Sketchup::Edge.new(p3, p0)]
-    [Sketchup::Face.new(edges, Geom::Vector3d.new(0, 0, 1)), p0, p1, p2, p3]
+    overlay = TestHarness.build_overlay(model: @model, selection: @model.selection)
+    overlay.enabled = true
+    overlay
   end
 
   def operation_starts
     @model.operation_log.select { |entry| entry[0] == :start }
   end
 
-  # -- Face alignment -----------------------------------------------------
-
-  def test_align_face_stores_the_normal_as_z_and_the_nearest_edge_as_x
-    g = TestFixtures.group_box
-    g.transformation = Geom::Transformation.rotation(ORIGIN, Z_AXIS, 40.degrees) *
-                        Geom::Transformation.translation(Geom::Vector3d.new(1.m, 0, 0))
-    overlay = build_overlay_with(g)
-    face, p0, p1, = build_diamond_top_face
-    hit_position = Geom::Point3d.new((p0.x + p1.x) / 2.0, (p0.y + p1.y) / 2.0, p0.z).transform(g.transformation)
-
-    assert overlay.apply_face_alignment(g, [g, face], hit_position)
-
-    assert CO.stored?(g)
-    world_x, _y, world_z = CO.world_axes_for(g)
-    expected_z = Geom::Vector3d.new(0, 0, 1).transform(g.transformation).normalize
-    expected_x = p0.vector_to(p1).transform(g.transformation).normalize
-    assert_in_delta 1.0, world_z.dot(expected_z), 1e-6
-    assert_in_delta 1.0, world_x.dot(expected_x), 1e-6
-    refute_in_delta 1.0, world_x.dot(g.transformation.xaxis), 1e-2,
-      'the diamond face sits at 45 degrees to the native axes -- alignment must actually differ from them'
-
-    assert_equal P::LOCAL_ORIENTATION, P::PLUGIN.gizmo_orientation, 'a successful face align switches to Object orientation'
-    assert_equal 1, operation_starts.length
-    assert_equal %i[start commit], @model.operation_log.map(&:first)
+  # Queues the InputPoint that the NEXT onMouseMove/onLButtonUp pair will
+  # resolve to -- entities is the simulated instance_path, root-most first,
+  # exactly like a real Sketchup::InputPoint#instance_path.
+  def queue_pick(point, entities, valid: true)
+    @model.active_view.next_input_point = { position: point, instance_path: entities, valid: valid }
   end
 
-  def test_align_face_prefers_the_boundary_edge_nearest_the_clicked_point
+  # One simulated click: queue the pick, then drive the same mouse events a
+  # live click would fire (move updates the live InputPoint, down is a
+  # no-op passthrough, up commits it) through the overlay's own callbacks --
+  # never through a separate pushed Tool.
+  def click(overlay, point, entities, valid: true)
+    view = @model.active_view
+    queue_pick(point, entities, valid: valid)
+    overlay.onMouseMove(0, 0, 0, view)
+    overlay.onLButtonDown(0, 0, 0, view)
+    overlay.onLButtonUp(0, 0, 0, view)
+  end
+
+  def press_escape(overlay)
+    overlay.onKeyDown(P::GizmoOverlay::ESCAPE_KEY, 1, 0, @model.active_view)
+  end
+
+  def press_backspace(overlay)
+    overlay.onKeyDown(P::GizmoOverlay::BACKSPACE_KEY, 1, 0, @model.active_view)
+  end
+
+  # -- Basic 3-point math ---------------------------------------------------
+
+  def test_three_points_produce_the_expected_orthonormal_right_handed_basis
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
-    face, p0, p1, p2, = build_diamond_top_face
+    overlay.start_point_orientation_picker
 
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p1.x + p2.x) / 2.0, (p1.y + p2.y) / 2.0, p1.z))
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
 
-    world_x, = CO.world_axes_for(g)
-    expected = p1.vector_to(p2).normalize
-    assert_in_delta 1.0, world_x.dot(expected), 1e-6,
-      'clicking nearer the p1-p2 edge must pick that edge, not the one nearer p0'
+    assert CO.stored?(g)
+    x, y, z = CO.world_axes_for(g)
+    assert_in_delta 1.0, x.dot(Geom::Vector3d.new(1, 0, 0)), 1e-9
+    assert_in_delta 1.0, y.dot(Geom::Vector3d.new(0, 1, 0)), 1e-9
+    assert_in_delta 1.0, z.dot(Geom::Vector3d.new(0, 0, 1)), 1e-9
+    assert_in_delta 1.0, x.cross(y).dot(z), 1e-9, 'must be right-handed: x.cross(y) == z'
+    assert_equal P::LOCAL_ORIENTATION, P::PLUGIN.gizmo_orientation,
+      'completing all 3 points switches to Object orientation'
+    refute overlay.point_orientation_active?
+  end
+
+  def test_point_3_selects_the_positive_y_side_and_flips_z_accordingly
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, -5, 0), [g]) # the OTHER side this time
+
+    _x, y, z = CO.world_axes_for(g)
+    assert_in_delta 1.0, y.dot(Geom::Vector3d.new(0, -1, 0)), 1e-9,
+      'Y must follow whichever side point 3 was picked on'
+    assert_in_delta 1.0, z.dot(Geom::Vector3d.new(0, 0, -1)), 1e-9,
+      'Z flips to keep X, Y, Z right-handed for the chosen Y side'
   end
 
   def test_face_alignment_does_not_move_rotate_scale_or_otherwise_touch_the_geometry
@@ -253,73 +264,122 @@ class CustomGizmoOrientationTest < Minitest::Test
     original_transformation = g.transformation.to_a
     original_bounds = [g.bounds.min.to_a, g.bounds.max.to_a]
     overlay = build_overlay_with(g)
-    face, p0, p1, = build_diamond_top_face
+    overlay.start_point_orientation_picker
 
-    overlay.apply_face_alignment(g, [g, face], p0.vector_to(p1).length.zero? ? p0 : Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
 
     assert_equal original_transformation, g.transformation.to_a
     assert_equal original_bounds, [g.bounds.min.to_a, g.bounds.max.to_a]
+    assert_equal [g], @model.selection.to_a, 'the pivot/selection must never change either'
   end
 
-  # -- Edge alignment -------------------------------------------------------
+  # -- Rejections: coincident point 2, collinear point 3 --------------------
 
-  def test_align_edge_preserves_the_current_custom_z_and_only_changes_x
+  def test_a_second_point_coincident_with_the_first_is_rejected_and_stays_retryable
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    _x_before, _y_before, z_before = CO.world_axes_for(g)
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
 
-    other_edge = Sketchup::Edge.new(Geom::Point3d.new(0, 0, 5), Geom::Point3d.new(0, 10, 5)) # local +Y
-    assert overlay.apply_edge_alignment(g, [g, other_edge])
-
-    world_x, _y, world_z = CO.world_axes_for(g)
-    assert_in_delta 1.0, world_z.dot(z_before), 1e-9, 'Z must be unchanged by an edge-align'
-    assert_in_delta 1.0, world_x.dot(Geom::Vector3d.new(0, 1, 0)), 1e-6
-  end
-
-  def test_align_edge_without_a_prior_face_align_preserves_the_native_z
-    g = TestFixtures.group_box
-    g.transformation = Geom::Transformation.rotation(ORIGIN, Y_AXIS, 15.degrees)
-    overlay = build_overlay_with(g)
-    edge = Sketchup::Edge.new(Geom::Point3d.new(0, 0, 0), Geom::Point3d.new(1, 0, 0))
-
-    assert overlay.apply_edge_alignment(g, [g, edge])
-
-    _x, _y, world_z = CO.world_axes_for(g)
-    assert_in_delta 1.0, world_z.dot(g.transformation.zaxis), 1e-6
-  end
-
-  def test_align_edge_accepts_an_individual_segment_of_a_curve
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    curve_segment = Sketchup::Edge.new(Geom::Point3d.new(0, 0, 0), Geom::Point3d.new(1, 0, 0))
-    curve_segment.curve = Object.new # merely flagged as part of a Curve/ArcCurve
-
-    assert overlay.apply_edge_alignment(g, [g, curve_segment]),
-      'a single straight segment of a curve is still a valid, usable edge direction'
-  end
-
-  def test_align_edge_rejects_an_edge_parallel_to_the_current_z_with_no_model_change
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    before_x, before_y, before_z = CO.world_axes_for(g)
-    log_before = @model.operation_log.dup
-
-    vertical_edge = Sketchup::Edge.new(Geom::Point3d.new(2, 3, 0), Geom::Point3d.new(2, 3, 5)) # parallel to native Z
-    refute overlay.apply_edge_alignment(g, [g, vertical_edge])
-
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g]) # same as point 1
     refute_nil UI.last_messagebox_text
-    assert_equal log_before, @model.operation_log, 'a rejected edge must not open an Undo operation'
-    after_x, after_y, after_z = CO.world_axes_for(g)
-    assert_in_delta 1.0, before_x.dot(after_x), 1e-9
-    assert_in_delta 1.0, before_y.dot(after_y), 1e-9
-    assert_in_delta 1.0, before_z.dot(after_z), 1e-9
+    assert overlay.point_orientation_active?, 'a rejected point 2 must not cancel the whole operation'
+
+    UI.last_messagebox_text = nil
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g]) # a valid point 2 now
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
+
+    assert CO.stored?(g), 'the operation must still complete normally after the retry'
+    assert_nil UI.last_messagebox_text
   end
 
-  # -- Reset ----------------------------------------------------------------
+  def test_a_third_point_collinear_with_the_first_two_is_rejected_and_stays_retryable
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+
+    click(overlay, Geom::Point3d.new(5, 0, 0), [g]) # on the X line -- collinear
+    refute_nil UI.last_messagebox_text
+    refute CO.stored?(g)
+    assert overlay.point_orientation_active?, 'a rejected point 3 must not cancel the whole operation'
+
+    UI.last_messagebox_text = nil
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g]) # a valid point 3 now
+
+    assert CO.stored?(g), 'the operation must still complete normally after the retry'
+    assert_nil UI.last_messagebox_text
+  end
+
+  # -- Ownership filtering ---------------------------------------------------
+
+  def test_a_pick_belonging_to_another_object_is_ignored_and_stays_retryable
+    g = TestFixtures.group_box
+    other = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+
+    click(overlay, Geom::Point3d.new(0, 0, 0), [other]) # wrong object
+    assert_nil UI.last_messagebox_text, 'an ownership miss is silent, unlike a geometric rejection'
+    assert overlay.point_orientation_active?
+
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g]) # now the right object
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
+
+    assert CO.stored?(g)
+  end
+
+  def test_a_pick_that_resolves_to_no_geometry_at_all_is_ignored
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+
+    click(overlay, Geom::Point3d.new(0, 0, 0), nil) # arbitrary empty-space point
+    assert overlay.point_orientation_active?
+    refute CO.stored?(g)
+  end
+
+  # -- Cancellation (Esc) -----------------------------------------------------
+
+  def test_esc_cancels_the_whole_operation_with_no_undo_and_no_orientation_change
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+
+    press_escape(overlay)
+
+    refute overlay.point_orientation_active?
+    refute CO.stored?(g)
+    assert_empty @model.operation_log, 'Esc must never open an Undo operation'
+  end
+
+  def test_backspace_steps_back_exactly_one_point
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+
+    press_backspace(overlay)
+    assert overlay.point_orientation_active?
+    # Point 2 was stepped back, not point 1 -- re-picking a DIFFERENT point 2
+    # must still work normally.
+    click(overlay, Geom::Point3d.new(0, 10, 0), [g])
+    click(overlay, Geom::Point3d.new(-5, 3, 0), [g])
+
+    assert CO.stored?(g)
+    x, = CO.world_axes_for(g)
+    assert_in_delta 1.0, x.dot(Geom::Vector3d.new(0, 1, 0)), 1e-9,
+      'the stepped-back-and-repicked point 2 must be the one actually used'
+  end
+
+  # -- Reset --------------------------------------------------------------
 
   def test_reset_removes_only_the_custom_orientation_and_is_a_no_op_when_absent
     g = TestFixtures.group_box
@@ -329,259 +389,16 @@ class CustomGizmoOrientationTest < Minitest::Test
     overlay.reset_gizmo_orientation
     assert_empty @model.operation_log, 'resetting when nothing is stored must not open an Undo operation'
 
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
     assert CO.stored?(g)
 
     overlay.reset_gizmo_orientation
     refute CO.stored?(g)
     assert_equal 'v', g.get_attribute('SomeOtherExtension', 'k')
     assert_equal %i[start commit start commit], @model.operation_log.map(&:first)
-  end
-
-  # -- Picker completion: event-driven restore via tool_changed -------------
-  #
-  # Regression coverage for the bug where the gizmo stayed hidden after a
-  # successful face/edge pick (or Esc) until the user made one extra click.
-  # A zero-delay timer (tried first) was NOT a reliable fix: it forced the
-  # restore inline without ever confirming SketchUp had actually finished
-  # deactivating OrientationPickerTool, and live testing showed the gizmo
-  # still stayed hidden. The real fix is event-driven: finish_orientation_
-  # picker only pops the tool and marks a pending restore; the actual
-  # restore only happens once SketchUp's own ToolsObserver#onActiveTool
-  # Changed notification arrives, via tool_changed -> complete_orientation_
-  # picker_restore. A short, bounded chain of rechecks (UI.timer_blocks in
-  # this test double) exists only as a safety net for the notification
-  # never arriving at all -- it is not the primary completion path.
-
-  def push_picker(overlay, entity, mode = :face)
-    tool = P::OrientationPickerTool.new(overlay, mode, entity)
-    overlay.instance_variable_set(:@orientation_picker, tool)
-    @model.tools.push_tool(tool)
-    tool
-  end
-
-  def test_a_successful_face_pick_pops_the_tool_and_leaves_the_gizmo_pending_until_tool_changed
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    push_picker(overlay, g, :face)
-    overlay.instance_variable_set(:@native_tool_override, true)
-    face, p0, p1, = build_diamond_top_face
-
-    assert overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    overlay.finish_orientation_picker(@model.active_view)
-
-    assert_nil @model.tools.active_tool, 'the picker tool must be popped immediately'
-    assert overlay.instance_variable_get(:@pending_orientation_picker_restore), 'a restore must now be pending'
-    assert overlay.instance_variable_get(:@native_tool_override), 'the gizmo must stay pending -- no inline restore'
-    refute overlay.active_gizmo
-
-    overlay.tool_changed('SelectionTool')
-
-    assert_nil overlay.instance_variable_get(:@pending_orientation_picker_restore)
-    refute overlay.instance_variable_get(:@native_tool_override), 'tool_changed completes the restore'
-    assert overlay.active_gizmo, 'the gizmo must be visible again without any further click'
-  end
-
-  def test_a_successful_edge_pick_also_completes_only_via_tool_changed
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    push_picker(overlay, g, :edge)
-    overlay.instance_variable_set(:@native_tool_override, true)
-    edge = Sketchup::Edge.new(Geom::Point3d.new(0, 0, 0), Geom::Point3d.new(1, 0, 0))
-
-    assert overlay.apply_edge_alignment(g, [g, edge])
-    overlay.finish_orientation_picker(@model.active_view)
-
-    assert_nil @model.tools.active_tool
-    assert overlay.instance_variable_get(:@native_tool_override), 'still pending -- not restored inline'
-
-    overlay.tool_changed('SelectionTool')
-
-    refute overlay.instance_variable_get(:@native_tool_override)
-    assert overlay.active_gizmo
-  end
-
-  def test_esc_pops_immediately_with_no_undo_and_also_completes_only_via_tool_changed
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    tool = push_picker(overlay, g, :face)
-    overlay.instance_variable_set(:@native_tool_override, true)
-    refute CO.stored?(g)
-
-    tool.onCancel(0, @model.active_view)
-
-    assert_nil @model.tools.active_tool, 'Esc must pop the picker immediately'
-    assert_empty @model.operation_log, 'Esc must never open an Undo operation'
-    assert overlay.instance_variable_get(:@native_tool_override), 'the restore is still pending at this point'
-
-    overlay.tool_changed('SelectionTool')
-
-    refute CO.stored?(g), 'Esc must not create a custom orientation'
-    refute overlay.instance_variable_get(:@native_tool_override), 'Esc must restore the gizmo without a further click'
-    assert overlay.active_gizmo
-  end
-
-  def test_the_selected_object_and_custom_orientation_survive_the_whole_picker_and_restore_flow
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    push_picker(overlay, g, :face)
-    face, p0, p1, = build_diamond_top_face
-
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    world_x_before, = CO.world_axes_for(g)
-    overlay.finish_orientation_picker(@model.active_view)
-    overlay.tool_changed('SelectionTool')
-
-    assert_equal [g], @model.selection.to_a, 'the picker flow must never change the selection'
-    world_x_after, = CO.world_axes_for(g)
-    assert_in_delta 1.0, world_x_before.dot(world_x_after), 1e-9, 'the restore itself must never touch the stored orientation'
-  end
-
-  def test_the_view_is_invalidated_once_tool_changed_completes_the_restore
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    push_picker(overlay, g, :face)
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    overlay.finish_orientation_picker(@model.active_view)
-    invalidations_before = @model.active_view.invalidate_count
-
-    overlay.tool_changed('SelectionTool')
-
-    assert_operator @model.active_view.invalidate_count, :>, invalidations_before
-  end
-
-  def test_finishing_and_completing_the_picker_never_opens_an_additional_undo_operation
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    push_picker(overlay, g, :face)
-    face, p0, p1, = build_diamond_top_face
-
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    log_after_align = @model.operation_log.dup
-
-    overlay.finish_orientation_picker(@model.active_view)
-    overlay.tool_changed('SelectionTool')
-
-    assert_equal log_after_align, @model.operation_log,
-      'popping the picker and restoring the gizmo must never start a second Undo operation'
-  end
-
-  def test_an_unrelated_tool_change_with_nothing_pending_does_not_touch_the_picker_state
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    refute overlay.instance_variable_get(:@pending_orientation_picker_restore)
-
-    overlay.tool_changed('MoveTool') # an ordinary, unrelated tool change
-
-    assert_nil overlay.instance_variable_get(:@pending_orientation_picker_restore)
-    assert overlay.instance_variable_get(:@native_tool_override), 'ordinary tool_changed logic must still run unchanged'
-  end
-
-  def test_a_tool_changed_notification_after_the_restore_already_completed_is_a_harmless_no_op
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    push_picker(overlay, g, :face)
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    overlay.finish_orientation_picker(@model.active_view)
-    overlay.tool_changed('SelectionTool')
-    assert overlay.active_gizmo
-
-    overlay.tool_changed('SelectionTool') # a second, stale notification
-
-    assert_equal [g], @model.selection.to_a
-    refute overlay.instance_variable_get(:@native_tool_override)
-  end
-
-  # -- Bounded fallback: only for the abnormal case tool_changed never fires
-
-  def test_the_first_bounded_fallback_tick_leaves_the_restore_pending
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    push_picker(overlay, g, :face)
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    overlay.instance_variable_set(:@native_tool_override, true)
-
-    overlay.finish_orientation_picker(@model.active_view)
-    assert_equal 1, UI.timer_blocks.length, 'only the next check is scheduled, not the whole bounded chain at once'
-
-    UI.timer_blocks.last.call # first (0.05s) recheck: not the last attempt
-
-    assert overlay.instance_variable_get(:@pending_orientation_picker_restore), 'still pending -- not yet forced'
-    assert overlay.instance_variable_get(:@native_tool_override)
-    assert_equal 2, UI.timer_blocks.length, 'the next bounded recheck is scheduled'
-  end
-
-  def test_the_bounded_fallback_eventually_forces_the_restore_if_tool_changed_never_arrives
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    push_picker(overlay, g, :face)
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    overlay.instance_variable_set(:@native_tool_override, true)
-
-    overlay.finish_orientation_picker(@model.active_view)
-    # Walk the whole bounded chain -- tool_changed is never simulated here.
-    # Each fired block may itself schedule one more (closer) recheck, so
-    # keep firing the newest one until the pending restore is gone.
-    while overlay.instance_variable_get(:@pending_orientation_picker_restore)
-      before = UI.timer_blocks.length
-      UI.timer_blocks.last.call
-      break if UI.timer_blocks.length == before && overlay.instance_variable_get(:@pending_orientation_picker_restore)
-    end
-
-    refute overlay.instance_variable_get(:@native_tool_override), 'the last bounded recheck forces the restore'
-    assert overlay.active_gizmo
-  end
-
-  def test_a_stale_fallback_from_a_superseded_picker_session_is_ignored
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    push_picker(overlay, g, :face)
-    overlay.instance_variable_set(:@native_tool_override, true)
-    overlay.finish_orientation_picker(@model.active_view)
-    stale_block = UI.timer_blocks.last
-
-    # A newer picker session starts and finishes before the stale fallback
-    # from the first one ever fires (e.g. Esc right after a face-align).
-    push_picker(overlay, g, :face)
-    overlay.finish_orientation_picker(@model.active_view)
-
-    stale_block.call
-    assert overlay.instance_variable_get(:@pending_orientation_picker_restore),
-      'a fallback tied to a superseded session must never touch the newer one'
-
-    overlay.tool_changed('SelectionTool')
-    refute overlay.instance_variable_get(:@native_tool_override), 'the newer session still restores normally'
-  end
-
-  def test_a_pending_restore_is_abandoned_once_the_overlay_has_moved_to_another_model
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    overlay.enabled = true
-    original_model = @model
-    push_picker(overlay, g, :face)
-    overlay.instance_variable_set(:@native_tool_override, true)
-    overlay.finish_orientation_picker(original_model.active_view)
-
-    overlay.instance_variable_set(:@model, Sketchup::Model.new)
-
-    overlay.tool_changed('SelectionTool') # delivered for the OLD model's tool stack
-    assert overlay.instance_variable_get(:@native_tool_override),
-      'a restore pending for a since-abandoned model must not fire against the new one'
   end
 
   # -- gizmo_state_for_current_selection / Global-mode isolation -----------
@@ -595,20 +412,23 @@ class CustomGizmoOrientationTest < Minitest::Test
     native = overlay.gizmo_state_for_current_selection
     assert_in_delta 1.0, native[:axes][1].dot(g.transformation.xaxis), 1e-6
 
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0).transform(g.transformation), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0).transform(g.transformation), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0).transform(g.transformation), [g])
 
     custom = overlay.gizmo_state_for_current_selection
     world_x, = CO.world_axes_for(g)
     assert_in_delta 1.0, custom[:axes][1].dot(world_x), 1e-6
-    refute_in_delta 1.0, custom[:axes][1].dot(g.transformation.xaxis), 1e-2
   end
 
   def test_global_orientation_ignores_any_stored_custom_orientation
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
     assert CO.stored?(g), 'sanity: a custom orientation is stored'
 
     P::PLUGIN.test_gizmo_orientation = P::GLOBAL_ORIENTATION
@@ -617,28 +437,30 @@ class CustomGizmoOrientationTest < Minitest::Test
     assert_in_delta 1.0, state[:axes][3].dot(@model.axes.zaxis), 1e-9
   end
 
-  # -- Undo/Redo: fresh read every time, exactly like every other setting ---
+  # -- Mirrored / non-uniform instance --------------------------------------
 
-  def test_gizmo_axes_immediately_reflect_an_undo_or_redo_of_the_stored_orientation
+  def test_a_mirrored_instance_still_reconstructs_a_valid_right_handed_basis_after_3_point_align
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
-    P::PLUGIN.test_gizmo_orientation = P::LOCAL_ORIENTATION
-    face, p0, p1, = build_diamond_top_face
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    aligned_x = overlay.gizmo_state_for_current_selection[:axes][1]
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
+    assert CO.stored?(g)
 
-    # Simulates "the user pressed Ctrl+Z": the attribute write is undone.
-    g.delete_attribute(CO::DICTIONARY_NAME)
-    reverted_x = overlay.gizmo_state_for_current_selection[:axes][1]
-    assert_in_delta 1.0, reverted_x.dot(g.transformation.xaxis), 1e-6
+    g.transformation = Geom::Transformation.new(
+      Geom::Vector3d.new(-1, 0, 0), Geom::Vector3d.new(0, 1, 0), Geom::Vector3d.new(0, 0, 1), ORIGIN
+    )
 
-    # Simulates "the user pressed Ctrl+Y" (redo): the attribute reappears.
-    CO.store!(g, aligned_x, Geom::Vector3d.new(0, 0, 1))
-    redone_x = overlay.gizmo_state_for_current_selection[:axes][1]
-    assert_in_delta 1.0, redone_x.dot(aligned_x), 1e-6
+    x, y, z = CO.world_axes_for(g)
+    assert_in_delta 1.0, x.length, 1e-9
+    assert_in_delta 1.0, y.length, 1e-9
+    assert_in_delta 1.0, z.length, 1e-9
+    assert_in_delta 0.0, x.dot(y), 1e-9
+    assert_in_delta 1.0, x.cross(y).dot(z), 1e-6, 'must stay right-handed even when the instance is later mirrored'
   end
 
-  # -- Shared component: a second instance is unaffected --------------------
+  # -- Per-instance persistence: a shared component's second instance -------
 
   def test_a_shared_components_second_instance_is_unaffected_by_aligning_the_first
     component = TestFixtures.ordinary_component
@@ -646,48 +468,113 @@ class CustomGizmoOrientationTest < Minitest::Test
     second = Sketchup::ComponentInstance.new(definition)
 
     overlay = build_overlay_with(component)
-    face, p0, p1, = build_diamond_top_face
-    assert overlay.apply_face_alignment(component, [component, face],
-      Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [component])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [component])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [component])
 
     assert CO.stored?(component)
     refute CO.stored?(second), "aligning one instance's gizmo must never affect another instance of the same component"
+  end
 
-    overlay_two = build_overlay_with(second)
-    state_two = overlay_two.gizmo_state_for_current_selection
-    P::PLUGIN.test_gizmo_orientation = P::LOCAL_ORIENTATION
-    state_two = overlay_two.gizmo_state_for_current_selection
-    assert_in_delta 1.0, state_two[:axes][1].dot(second.transformation.xaxis), 1e-6
+  # -- Undo -------------------------------------------------------------------
+
+  def test_completing_all_three_points_creates_exactly_one_undo_operation
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
+
+    assert_equal 1, operation_starts.length
+    assert_equal %i[start commit], @model.operation_log.map(&:first)
+  end
+
+  # -- Immediate reactivation, no extra click, no timer machinery -----------
+
+  def test_the_gizmo_reactivates_immediately_after_completion_with_no_extra_click_or_timer
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
+
+    refute overlay.point_orientation_active?
+    refute overlay.instance_variable_get(:@native_tool_override),
+      'no tool-stack transition ever happens for this picker, so nothing needs to be un-hidden'
+    assert_equal [g], @model.selection.to_a
+    assert_empty UI.started_timers, 'no timer of any kind is used to restore the gizmo'
+    assert_empty UI.timer_blocks
+  end
+
+  def test_the_gizmo_reactivates_immediately_after_esc_with_no_extra_click_or_timer
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+
+    press_escape(overlay)
+
+    refute overlay.point_orientation_active?
+    refute overlay.instance_variable_get(:@native_tool_override)
+    assert_equal [g], @model.selection.to_a
+    assert_empty UI.started_timers
+    assert_empty UI.timer_blocks
+  end
+
+  def test_a_right_click_mid_pick_cancels_it_the_same_way_as_esc
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.define_singleton_method(:gizmo_hovering?) { |*| false }
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+
+    overlay.getMenu(FakeMenuForOrientationTest.new, 0, 0, 0, @model.active_view)
+
+    refute overlay.point_orientation_active?
+    assert_empty @model.operation_log
   end
 
   # -- Licensing --------------------------------------------------------------
 
-  def test_face_and_edge_alignment_and_reset_are_all_refused_when_unlicensed
+  def test_completing_all_three_points_is_refused_when_unlicensed_with_no_undo
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
-    face, p0, p1, = build_diamond_top_face
-    edge = Sketchup::Edge.new(Geom::Point3d.new(0, 0, 0), Geom::Point3d.new(1, 0, 0))
+    overlay.start_point_orientation_picker
 
     TestLicense.unlicensed do
-      refute overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-      refute overlay.apply_edge_alignment(g, [g, edge])
+      click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+      click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+      click(overlay, Geom::Point3d.new(3, 5, 0), [g])
     end
-    refute CO.stored?(g)
-    assert_empty @model.operation_log, 'a refused alignment must not open an Undo operation'
 
-    assert overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    refute CO.stored?(g)
+    assert_empty @model.operation_log, 'a refused completion must not open an Undo operation'
+    refute overlay.point_orientation_active?, 'the session still ends -- retrying the same refusal is pointless'
+  end
+
+  def test_reset_is_refused_when_unlicensed
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.start_point_orientation_picker
+    click(overlay, Geom::Point3d.new(0, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(10, 0, 0), [g])
+    click(overlay, Geom::Point3d.new(3, 5, 0), [g])
     assert CO.stored?(g)
+
     TestLicense.unlicensed { overlay.reset_gizmo_orientation }
     assert CO.stored?(g), 'a refused reset must not remove the stored orientation'
   end
 
-  def test_the_context_menu_items_carry_the_same_license_gate_as_every_other_gizmo_action
+  def test_the_context_menu_item_carries_the_same_license_gate_as_every_other_gizmo_action
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
     overlay.display_authorized = true
     overlay.define_singleton_method(:gizmo_hovering?) { |*| true }
     picker_calls = []
-    overlay.define_singleton_method(:start_orientation_picker) { |mode| picker_calls << mode }
+    overlay.define_singleton_method(:start_point_orientation_picker) { picker_calls << true }
     reset_calls = []
     overlay.define_singleton_method(:reset_gizmo_orientation) { reset_calls << true }
 
@@ -695,8 +582,7 @@ class CustomGizmoOrientationTest < Minitest::Test
     overlay.getMenu(menu, 0, 0, 0, @model.active_view)
 
     TestLicense.unlicensed do
-      menu.items['Align Gizmo XY to Face...'].call
-      menu.items['Align Gizmo X to Edge...'].call
+      menu.items['Set Gizmo Orientation by 3 Points...'].call
       menu.items['Reset Gizmo Orientation to Object Axes'].call
     end
     assert_empty picker_calls
@@ -705,11 +591,10 @@ class CustomGizmoOrientationTest < Minitest::Test
 
     UI.last_messagebox_text = nil
     TestLicense.with_state(L::LICENSED) do
-      menu.items['Align Gizmo XY to Face...'].call
-      menu.items['Align Gizmo X to Edge...'].call
+      menu.items['Set Gizmo Orientation by 3 Points...'].call
       menu.items['Reset Gizmo Orientation to Object Axes'].call
     end
-    assert_equal %i[face edge], picker_calls
+    assert_equal [true], picker_calls
     assert_equal [true], reset_calls
     assert_nil UI.last_messagebox_text
   end
@@ -728,138 +613,5 @@ class CustomGizmoOrientationTest < Minitest::Test
 
     def set_validation_proc(_id, &_block); end
     def add_separator; end
-  end
-end
-
-# -- OrientationPickerTool: ownership/type filtering and Esc, in isolation ----
-class OrientationPickerToolTest < Minitest::Test
-  P = Zbellbound::SmartGizmoPro
-
-  class FakePickModel
-    attr_reader :pops
-
-    def initialize(hit)
-      @hit = hit
-      @pops = 0
-    end
-
-    def raytest(_ray, _include_hidden)
-      @hit
-    end
-
-    def tools
-      self
-    end
-
-    def pop_tool
-      @pops += 1
-    end
-  end
-
-  class FakePickView
-    attr_reader :model
-
-    def initialize(model)
-      @model = model
-    end
-
-    def pickray(_x, _y)
-      :ray
-    end
-  end
-
-  def spy_overlay
-    calls = []
-    overlay = Object.new
-    overlay.define_singleton_method(:apply_face_alignment) { |*a| calls << [:face, *a]; true }
-    overlay.define_singleton_method(:apply_edge_alignment) { |*a| calls << [:edge, *a]; true }
-    # The real GizmoOverlay#finish_orientation_picker pops the tool itself
-    # (see the production method) -- reproduced minimally here so this
-    # spy still exercises exactly what OrientationPickerTool is required to
-    # call on every exit path (success or Esc), without pulling in the real
-    # overlay's deferred-refresh machinery, which is covered separately
-    # against the real GizmoOverlay below.
-    overlay.define_singleton_method(:finish_orientation_picker) { |view| view.model.tools.pop_tool }
-    [overlay, calls]
-  end
-
-  def test_a_pick_belonging_to_a_different_object_is_ignored_and_the_picker_stays_active
-    overlay, calls = spy_overlay
-    target = Object.new
-    other = Object.new
-    face = Object.new
-    model = FakePickModel.new([ORIGIN, [other, face]])
-    tool = P::OrientationPickerTool.new(overlay, :face, target)
-
-    tool.onLButtonUp(0, 10, 10, FakePickView.new(model))
-
-    assert_empty calls
-    assert_equal 0, model.pops, 'a mismatched pick must not pop the picker -- the user can try again'
-  end
-
-  def test_a_pick_of_the_wrong_leaf_type_is_ignored
-    overlay, calls = spy_overlay
-    target = Object.new
-    edge = Sketchup::Edge.new(ORIGIN, Geom::Point3d.new(1, 0, 0))
-    model = FakePickModel.new([ORIGIN, [target, edge]]) # an edge, but mode is :face
-
-    P::OrientationPickerTool.new(overlay, :face, target).onLButtonUp(0, 1, 1, FakePickView.new(model))
-
-    assert_empty calls
-    assert_equal 0, model.pops
-  end
-
-  def test_a_missed_pick_is_ignored
-    overlay, calls = spy_overlay
-    model = FakePickModel.new(nil)
-
-    P::OrientationPickerTool.new(overlay, :face, Object.new).onLButtonUp(0, 1, 1, FakePickView.new(model))
-
-    assert_empty calls
-    assert_equal 0, model.pops
-  end
-
-  def test_a_valid_face_pick_hands_off_to_the_overlay_and_pops_the_picker
-    overlay, calls = spy_overlay
-    target = Object.new
-    face = Sketchup::Face.new([], Geom::Vector3d.new(0, 0, 1))
-    model = FakePickModel.new([Geom::Point3d.new(1, 2, 3), [target, face]])
-
-    P::OrientationPickerTool.new(overlay, :face, target).onLButtonUp(0, 1, 1, FakePickView.new(model))
-
-    assert_equal 1, calls.length
-    assert_equal :face, calls.first[0]
-    assert_same target, calls.first[1]
-    assert_equal 1, model.pops
-  end
-
-  def test_a_valid_edge_pick_hands_off_to_the_overlay_and_pops_the_picker
-    overlay, calls = spy_overlay
-    target = Object.new
-    edge = Sketchup::Edge.new(ORIGIN, Geom::Point3d.new(1, 0, 0))
-    model = FakePickModel.new([Geom::Point3d.new(0.5, 0, 0), [target, edge]])
-
-    P::OrientationPickerTool.new(overlay, :edge, target).onLButtonUp(0, 1, 1, FakePickView.new(model))
-
-    assert_equal 1, calls.length
-    assert_equal :edge, calls.first[0]
-    assert_equal 1, model.pops
-  end
-
-  def test_escape_pops_the_picker_and_changes_nothing
-    overlay, calls = spy_overlay
-    model = FakePickModel.new(nil)
-    tool = P::OrientationPickerTool.new(overlay, :face, Object.new)
-
-    tool.onCancel(0, FakePickView.new(model))
-
-    assert_empty calls
-    assert_equal 1, model.pops
-  end
-
-  def test_double_click_is_swallowed_so_the_target_never_enters_edit_mode
-    overlay, = spy_overlay
-    tool = P::OrientationPickerTool.new(overlay, :face, Object.new)
-    assert_equal true, tool.onLButtonDoubleClick(0, 1, 1, nil)
   end
 end

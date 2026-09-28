@@ -317,6 +317,8 @@ module Zbellbound::SmartGizmoPro
     RIGHT_ARROW_KEY = defined?(VK_RIGHT) ? VK_RIGHT : 39
     DOWN_ARROW_KEY = defined?(VK_DOWN) ? VK_DOWN : 40
     MOVE_TOOL_KEY = 'M'.ord
+    ESCAPE_KEY = defined?(VK_ESCAPE) ? VK_ESCAPE : 27
+    BACKSPACE_KEY = defined?(VK_BACK) ? VK_BACK : 8
 
     MOVE_MODE_LABEL = 'Move'.freeze
     COPY_MODE_LABEL = 'Copy'.freeze
@@ -453,6 +455,10 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onMouseMove(flags, x, y, view)
+      if point_orientation_active?
+        handle_point_orientation_mouse_move(x, y, view)
+        return true
+      end
       return if inert?
       return if @mouse && @mouse == [x, y]
       return if @native_tool_override
@@ -494,6 +500,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onLButtonDown(flags, x, y, view)
+      return true if point_orientation_active?
       return if inert?
       return if @native_tool_override
 
@@ -538,6 +545,10 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onLButtonUp(flags, x, y, view)
+      if point_orientation_active?
+        handle_point_orientation_click(view)
+        return true
+      end
       return if @native_tool_override
 
       @flags = flags
@@ -576,19 +587,6 @@ module Zbellbound::SmartGizmoPro
     
     def tool_changed(tool_name)
       return unless enabled?
-
-      # A pending orientation-picker restore (see finish_orientation_picker)
-      # is handled FIRST, before @native_tool_override is even recomputed --
-      # this notification firing at all, after we've already popped
-      # OrientationPickerTool, IS SketchUp's own confirmation that it's no
-      # longer the active tool, and that confirmation must not be lost to
-      # (or delayed behind) the ordinary allow-list recompute below, which
-      # could otherwise re-set @native_tool_override before the gizmo is
-      # ever actually shown again.
-      if @pending_orientation_picker_restore
-        complete_orientation_picker_restore(tool_name)
-        return
-      end
 
       @current_tool_name = tool_name
       @native_tool_override = !gizmo_allowed_for_tool?(tool_name)
@@ -943,115 +941,181 @@ module Zbellbound::SmartGizmoPro
       set_custom_origin(@selection[0].transformation.origin)
     end
 
-    # -- Custom gizmo orientation (Align Gizmo XY to Face / X to Edge / Reset) -
+    # -- Custom gizmo orientation: Set Gizmo Orientation by 3 Points / Reset -
     #
-    # Popping OrientationPickerTool does not, by itself, tell us it has
-    # actually stopped being SketchUp's active tool -- that confirmation is
-    # ToolsObserver#onActiveToolChanged (tool_changed below), and it is
-    # delivered on SketchUp's own schedule, not synchronously inside
-    # pop_tool. A fixed deferred delay (tried and observed to fail live: it
-    # left the gizmo hidden until the user's next click) is not a
-    # substitute for that confirmation, so the real fix is event-driven:
-    # finish_orientation_picker only pops the tool and records that a
-    # restore is pending; the actual restore (gizmo, active_gizmo, view)
-    # happens once tool_changed actually fires. A bounded, self-cancelling
-    # chain of rechecks exists only as a last-resort safety net for the
-    # (abnormal) case where that notification never arrives at all.
+    # Collects three clicks directly through the overlay's OWN existing
+    # mouse/keyboard/draw callbacks (see the point_orientation_active?
+    # guards near the top of onMouseMove/onLButtonDown/onLButtonUp/
+    # onKeyDown/draw/getMenu) instead of pushing a separate modal Tool. An
+    # earlier face/edge picker design pushed (and later had to pop) its own
+    # Tool for this, which left the gizmo's reappearance depending on
+    # SketchUp's own ToolsObserver#onActiveToolChanged notification, or on a
+    # guessed timer delay -- neither reliable, both tried and abandoned.
+    # Sketchup::Overlay already receives mouse/key events whether or not it
+    # is pushed onto the tool stack, so never pushing a competing Tool for
+    # this avoids that whole class of bug: there is no other tool to
+    # return from, so the gizmo's normal state is never actually left.
 
-    ORIENTATION_PICKER_FALLBACK_DELAYS = [0.05, 0.2, 0.5].freeze
+    POINT_ORIENTATION_PROMPTS = [
+      'Pick orientation origin. Press Esc to cancel.',
+      'Pick positive X direction. Press Esc to cancel.',
+      'Pick positive Y side. Press Esc to cancel.'
+    ].freeze
 
-    # Pushes a small picker Tool (see OrientationPickerTool below) that
-    # collects one face or edge click belonging to the selected instance,
-    # without entering its edit context, then pops itself. This method only
-    # ever runs from the gizmo's own context menu, already gated by
+    def point_orientation_active?
+      !@point_orientation_session.nil?
+    end
+
+    # Only ever runs from the gizmo's own context menu, already gated by
     # license_permits_interaction? at the call site; the actual attribute
     # write is gated again, freshly, in commit_custom_orientation, since an
-    # arbitrarily long time may pass before the user completes the pick.
-    def start_orientation_picker(mode)
+    # arbitrarily long time may pass before the user completes all 3 clicks.
+    # The first point is only an orientation reference -- nothing about the
+    # pivot or the object itself is touched by starting (or running) this.
+    def start_point_orientation_picker
       return unless selected_one_object?
 
-      entity = @selection[0]
-      instruction = if mode == :face
-        "Click a face on the selected object to align the gizmo. Press Esc to cancel."
-      else
-        "Click a straight edge on the selected object to set gizmo X. Press Esc to cancel."
+      @point_orientation_session = { entity: @selection[0], points: [] }
+      @point_orientation_input_point = nil
+      Sketchup.set_status_text(POINT_ORIENTATION_PROMPTS[0])
+      @model.active_view.invalidate
+    end
+
+    # Esc, and a right-click that opens the context menu mid-pick (see
+    # getMenu), both cancel cleanly here: nothing was ever changed, so
+    # there is nothing to undo, and the gizmo's normal state was never
+    # actually left in the first place -- there's nothing to "reactivate".
+    def cancel_point_orientation_picker
+      return unless point_orientation_active?
+
+      finish_point_orientation_session
+    end
+
+    # Backspace steps back exactly one already-picked point (re-prompting
+    # for it) rather than cancelling the whole operation; a no-op before
+    # any point has been picked (Esc is the only way out at that point).
+    def step_back_point_orientation
+      return unless point_orientation_active?
+
+      points = @point_orientation_session[:points]
+      return if points.empty?
+
+      points.pop
+      Sketchup.set_status_text(POINT_ORIENTATION_PROMPTS[points.length])
+      @model.active_view.invalidate
+    end
+
+    # Refreshes the live InputPoint used both for the on-screen inference
+    # marker/tooltip (draw_point_orientation_session) and for the point a
+    # click will actually commit -- SketchUp's own documented pattern for
+    # point-picking tools, giving real vertex/edge/midpoint snapping
+    # instead of a plain, unsnapped raytest.
+    def handle_point_orientation_mouse_move(x, y, view)
+      ip = Sketchup::InputPoint.new
+      ip.pick(view, x, y)
+      @point_orientation_input_point = ip
+      tooltip = ip.tooltip
+      view.tooltip = tooltip if tooltip && !tooltip.empty?
+      view.invalidate
+    end
+
+    # A click that misses -- picked on another object, or nothing at all --
+    # simply leaves the picker active so the user can try again, exactly
+    # like the ownership/type misses in every gizmo picking flow already in
+    # this file. A geometrically invalid point (coincident with the origin,
+    # or collinear with the first two) gets a concise message instead, and
+    # also leaves that same stage active for a retry.
+    def handle_point_orientation_click(view)
+      session = @point_orientation_session
+      ip = @point_orientation_input_point
+      return unless session && ip && ip.valid?
+      return unless point_orientation_owns?(ip, session[:entity])
+
+      point = ip.position
+      case session[:points].length
+      when 0
+        session[:points] << point
+        Sketchup.set_status_text(POINT_ORIENTATION_PROMPTS[1])
+      when 1
+        if point.distance(session[:points][0]) < CustomOrientation::MIN_LENGTH
+          UI.messagebox("That point is the same as the orientation origin -- pick a different point for X.")
+          return
+        end
+        session[:points] << point
+        Sketchup.set_status_text(POINT_ORIENTATION_PROMPTS[2])
+      when 2
+        complete_point_orientation(session[:entity], session[:points][0], session[:points][1], point)
       end
-      Sketchup.set_status_text(instruction)
-      @orientation_picker = OrientationPickerTool.new(self, mode, entity)
-      @model.tools.push_tool(@orientation_picker)
+      view.invalidate
     end
 
-    # The one completion path for OrientationPickerTool, shared by a
-    # successful face alignment, a successful edge alignment, and Esc
-    # cancellation alike -- whichever happened (or didn't) has already been
-    # decided by the caller before this runs. Only pops the tool and marks
-    # a pending restore, tied to a fresh token (so an earlier, superseded
-    # pending restore can never complete later) and the model/selection
-    # generation active right now (so it can never apply to a model or
-    # selection that's since changed). The actual restore happens in
-    # complete_orientation_picker_restore, from tool_changed.
-    def finish_orientation_picker(view)
-      return unless @orientation_picker
+    # `entity` is the selected Group/ComponentInstance; input_point's own
+    # instance_path -- the full path from the model root down to the picked
+    # leaf Face/Edge/Vertex -- must be rooted at it. The same "belongs to
+    # the selected instance, not some other visible object" check the
+    # earlier face/edge picker made from a Model#raytest path, sourced from
+    # InputPoint here instead, since InputPoint (not a plain raytest) is
+    # what gives real vertex/edge snapping and inference markers.
+    def point_orientation_owns?(input_point, entity)
+      path = input_point.instance_path
+      return false unless path
 
-      model = view.model
-      model.tools.pop_tool
-      @orientation_picker = nil
-
-      token = (@orientation_picker_restore_token || 0) + 1
-      @orientation_picker_restore_token = token
-      @pending_orientation_picker_restore = { model: model, generation: @refresh_generation, token: token }
-
-      schedule_orientation_picker_restore_fallback(model, token)
+      entities = path.respond_to?(:to_a) ? path.to_a : Array(path)
+      !entities.empty? && entities.first == entity
     end
 
-    # The authoritative completion, run from tool_changed the moment
-    # SketchUp itself reports that the active tool changed (which, since
-    # OrientationPickerTool was already popped by finish_orientation_picker,
-    # can only mean it's no longer active) -- never guessed, and identified
-    # by this specific pending restore's token rather than by tool_name, so
-    # an unrelated or stale tool change can never trigger or interfere with
-    # it. Selection and any stored custom orientation are untouched; this
-    # only ever restores visibility.
-    def complete_orientation_picker_restore(tool_name)
-      return unless enabled?
+    # X = normalized(point1 -> point2). Y = point3's component perpendicular
+    # to X, normalized -- CustomOrientation.orthogonalize also IS the
+    # collinear-third-point rejection, since it returns nil when point3
+    # sits on the X line. Z = X.cross(Y). Only X and Z are stored:
+    # CustomOrientation always rederives Y fresh as Z.cross(X) on every
+    # read, which is exactly the "recalculate Y to guarantee an
+    # orthonormal, right-handed basis" step this feature's own spec asks
+    # for -- already built into the existing storage design.
+    def complete_point_orientation(entity, p1, p2, p3)
+      world_x_vector = p1.vector_to(p2)
+      if world_x_vector.length < CustomOrientation::MIN_LENGTH
+        UI.messagebox("That point is the same as the orientation origin -- pick a different point for X.")
+        return
+      end
+      world_x = world_x_vector.normalize
 
-      pending = @pending_orientation_picker_restore
-      return unless pending
-      return unless pending[:model] == @model && @model&.valid?
-      return unless pending[:generation] == @refresh_generation
+      world_y = CustomOrientation.orthogonalize(p1.vector_to(p3), world_x)
+      unless world_y
+        UI.messagebox("That third point is on the X axis line and can't define the Y side.")
+        return
+      end
+      world_z = world_x.cross(world_y).normalize
 
-      @pending_orientation_picker_restore = nil
-      @native_tool_override = false
-      @current_tool_name = tool_name
-      self.active_gizmo = enabled? && selection_present?
-      update_gizmo
-      @model.active_view.invalidate if @model&.active_view
+      commit_custom_orientation(entity, world_x, world_z, 'Set Gizmo Orientation by 3 Points')
+      finish_point_orientation_session
     end
 
-    # Last-resort safety net for the abnormal case where
-    # ToolsObserver#onActiveToolChanged never fires at all: a short, bounded
-    # chain of rechecks (never a single guessed delay) that only ever acts
-    # on ITS OWN token, so a later pick, a model change, or a selection
-    # change safely stops it from doing anything. Each step re-checks
-    # whether the real event has already completed the restore (i.e.
-    # whether a pending restore for this token still exists) before either
-    # rescheduling the next, closer check or -- only on the very last one --
-    # forcing the same restore tool_changed would have done.
-    def schedule_orientation_picker_restore_fallback(model, token, attempt = 0)
-      delay = ORIENTATION_PICKER_FALLBACK_DELAYS[attempt]
-      return unless delay
+    def draw_point_orientation_session(view)
+      session = @point_orientation_session
+      return unless session
 
-      UI.start_timer(delay, false) do
-        pending = @pending_orientation_picker_restore
-        next unless pending && pending[:token] == token
-        next unless model && model == @model && model.valid?
+      points = session[:points]
+      ip = @point_orientation_input_point
 
-        if attempt == ORIENTATION_PICKER_FALLBACK_DELAYS.length - 1
-          complete_orientation_picker_restore(@current_tool_name)
-        else
-          schedule_orientation_picker_restore_fallback(model, token, attempt + 1)
+      if points.length >= 1
+        endpoint = points[1] || (ip && ip.valid? ? ip.position : nil)
+        if endpoint
+          view.drawing_color = 'red'
+          view.line_width = 2
+          view.line_stipple = ''
+          view.draw(GL_LINES, [points[0], endpoint])
         end
       end
+
+      ip.draw(view) if ip && ip.valid?
+    end
+
+    def finish_point_orientation_session
+      @point_orientation_session = nil
+      @point_orientation_input_point = nil
+      Sketchup.set_status_text('')
+      @model.active_view.invalidate
     end
 
     # Removes only the stored custom orientation (native axes and geometry
@@ -1069,61 +1133,18 @@ module Zbellbound::SmartGizmoPro
       @model.active_view.invalidate
     end
 
-    # Called by OrientationPickerTool once it has already confirmed the pick
-    # is a Face belonging to `entity` (path.last), never entering edit mode
-    # to get it. `hit_position` is the world-space point raytest returned,
-    # used only to choose the nearest straight boundary edge for the initial
-    # X direction.
-    def apply_face_alignment(entity, path, hit_position)
-      face = path.last
-      world_transform = path_world_transform(path)
-      world_z = safe_face_normal(face, world_transform)
-      return false unless world_z
-
-      edge = closest_boundary_edge(face, world_transform, hit_position)
-      world_x = edge && edge_world_direction(edge, world_transform)
-      world_x = world_x && CustomOrientation.orthogonalize(world_x, world_z)
-      # No straight boundary edge (e.g. a fully circular face) or one that
-      # happened to come out ~parallel to the normal (degenerate geometry):
-      # a deterministic fallback still produces a valid, usable basis.
-      world_x ||= CustomOrientation.arbitrary_perpendicular(world_z)
-
-      commit_custom_orientation(entity, world_x, world_z, 'Align Gizmo to Face')
-    end
-
-    # Called by OrientationPickerTool once it has already confirmed the pick
-    # is a straight Edge (a single segment, even if part of a curve) belonging
-    # to `entity`. Preserves whichever Z the gizmo is currently showing --
-    # the custom one if already aligned, otherwise the entity's native Z --
-    # and only ever changes X (and, consequently, Y).
-    def apply_edge_alignment(entity, path)
-      edge = path.last
-      world_transform = path_world_transform(path)
-      world_edge = edge_world_direction(edge, world_transform)
-      return false unless world_edge
-
-      world_z = current_gizmo_z_direction(entity)
-      world_x = CustomOrientation.orthogonalize(world_edge, world_z)
-      unless world_x
-        UI.messagebox("That edge is nearly parallel to the gizmo's current Z axis and can't be used for X.")
-        return false
-      end
-
-      commit_custom_orientation(entity, world_x, world_z, 'Align Gizmo to Edge')
-    end
-
-    # The one Undo-wrapped write shared by both alignment commands: a fresh
-    # license check (start_licensed_operation), the attribute write, then an
-    # immediate gizmo refresh. Automatically switches to Object orientation,
-    # per the "Align Gizmo XY to Face" requirement -- harmless to also do
-    # this for edge-align, since a custom orientation is only ever consulted
-    # in Object mode in the first place (see gizmo_state_for_current_selection).
+    # The one Undo-wrapped write behind "Set Gizmo Orientation by 3
+    # Points": a fresh license check (start_licensed_operation), the
+    # attribute write, then an immediate gizmo refresh. Automatically
+    # switches to Object orientation, since a custom orientation is only
+    # ever consulted in Object mode in the first place (see
+    # gizmo_state_for_current_selection).
     def commit_custom_orientation(entity, world_x, world_z, operation_name)
       return false unless start_licensed_operation(operation_name)
 
       unless CustomOrientation.store!(entity, world_x, world_z)
         @model.abort_operation
-        UI.messagebox('Could not align the gizmo to that geometry.')
+        UI.messagebox('Could not set the gizmo orientation from those points.')
         return false
       end
 
@@ -1132,77 +1153,6 @@ module Zbellbound::SmartGizmoPro
       update_gizmo
       @model.active_view.invalidate
       true
-    end
-
-    # The world-space Z the gizmo is CURRENTLY showing for `entity`: the
-    # custom Z if one is already stored, otherwise the entity's native Z.
-    # "Align Gizmo X to Edge" preserves whichever this is -- it does not
-    # require a face to have been aligned first.
-    def current_gizmo_z_direction(entity)
-      custom = CustomOrientation.world_axes_for(entity)
-      return custom[2] if custom
-
-      entity.transformation.zaxis
-    end
-
-    # Product of the transformations of every entity in `path` EXCEPT the
-    # last (the picked Face/Edge itself) -- maps the leaf's own local
-    # coordinates into world space, the standard way to interpret a
-    # Sketchup::Model#raytest path.
-    def path_world_transform(path)
-      path[0...-1].reduce(IDENTITY) { |acc, step| acc * step.transformation }
-    end
-
-    def edge_world_direction(edge, world_transform)
-      local = edge.start.position.vector_to(edge.end.position)
-      return nil if local.length < CustomOrientation::MIN_LENGTH
-
-      CustomOrientation.safe_transform(local, world_transform)
-    end
-
-    # Transforming a normal vector correctly under non-uniform scale is a
-    # separate (inverse-transpose) computation from an ordinary vector
-    # transform, but the path between a picked face and the selected
-    # instance is a plain nested-group/component chain in the overwhelming
-    # majority of real models (rotation/translation, at most uniform scale)
-    # -- for that common case a plain transform is exact, and
-    # CustomOrientation's own reconstruction re-orthonormalizes on every
-    # read regardless, so a non-uniform-scale edge case here degrades to "a
-    # still-valid, still right-handed, merely not perfectly-perpendicular
-    # basis" rather than a crash or a broken gizmo.
-    def safe_face_normal(face, world_transform)
-      CustomOrientation.safe_transform(face.normal, world_transform)
-    end
-
-    # The edge on face's outer boundary nearest hit_position (world-space
-    # distance from the pick point to the closest point on each candidate
-    # segment). Every Edge -- including one flagged as part of a Curve/
-    # ArcCurve for a circle or a polyline -- is itself a single straight
-    # chord between two vertices, so none are excluded here: a circular
-    # face's boundary is internally many short straight Edge segments, and
-    # picking whichever is closest to the click gives a locally-relevant,
-    # deterministic X direction just as well as it does for a polygon face.
-    # nil only if the face's outer loop genuinely has no edges at all, in
-    # which case the caller falls back to
-    # CustomOrientation.arbitrary_perpendicular.
-    def closest_boundary_edge(face, world_transform, hit_position)
-      candidates = face.outer_loop.edges
-      return nil if candidates.empty?
-
-      candidates.min_by do |edge|
-        a = edge.start.position.transform(world_transform)
-        b = edge.end.position.transform(world_transform)
-        closest_point_on_segment(hit_position, a, b).distance(hit_position)
-      end
-    end
-
-    def closest_point_on_segment(point, a, b)
-      segment = a.vector_to(b)
-      length_squared = segment.length**2
-      return a if length_squared < CustomOrientation::MIN_LENGTH
-
-      t = (a.vector_to(point).dot(segment) / length_squared).clamp(0.0, 1.0)
-      Geom::Point3d.new(a.x + (segment.x * t), a.y + (segment.y * t), a.z + (segment.z * t))
     end
 
     def selected_entities
@@ -3473,6 +3423,12 @@ module Zbellbound::SmartGizmoPro
     end
 
     def getMenu(menu, _flags, x, y, view)
+      # A right-click while a 3-point pick is in progress cancels it (no
+      # Undo entry, nothing was ever changed) rather than leaving it
+      # stranded -- Esc is the documented way to cancel, but this is a safe
+      # second way out, matching how a right-click already ends any other
+      # in-progress gizmo gesture.
+      cancel_point_orientation_picker if point_orientation_active?
       return false if inert?
       return false unless gizmo_hovering?(x, y, view)
 
@@ -3489,8 +3445,7 @@ module Zbellbound::SmartGizmoPro
       end
       if selected_one_object?
         menu.add_separator
-        menu.add_item('Align Gizmo XY to Face...') { start_orientation_picker(:face) if license_permits_interaction? }
-        menu.add_item('Align Gizmo X to Edge...') { start_orientation_picker(:edge) if license_permits_interaction? }
+        menu.add_item('Set Gizmo Orientation by 3 Points...') { start_point_orientation_picker if license_permits_interaction? }
         menu.add_item('Reset Gizmo Orientation to Object Axes') { reset_gizmo_orientation if license_permits_interaction? }
       end
       menu.add_separator
@@ -3780,6 +3735,13 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onKeyDown(key, _repeat, _flags, view)
+      if point_orientation_active?
+        case key
+        when ESCAPE_KEY then cancel_point_orientation_picker
+        when BACKSPACE_KEY then step_back_point_orientation
+        end
+        return true
+      end
       return if inert?
 
       if key == MOVE_TOOL_KEY
@@ -3819,6 +3781,10 @@ module Zbellbound::SmartGizmoPro
       # Nothing is drawn unless the most recent silent authorization said yes;
       # draw never asks SketchUp about the license itself.
       return unless display_authorized?
+      if point_orientation_active?
+        draw_point_orientation_session(view)
+        return
+      end
       return if @native_tool_override
       return unless active_gizmo? && @gizmo
       sync_gizmo_refresh
@@ -3866,75 +3832,6 @@ module Zbellbound::SmartGizmoPro
       module_name = self.class.name.split('::')[-2]
       hex_id = format('0x%x', (object_id << 1))
       "#<#{module_name}::#{name}:#{hex_id}>"
-    end
-  end
-
-  # A short-lived tool (plain object, no Sketchup::Tool superclass to
-  # inherit -- SketchUp tools are duck-typed) that collects exactly one face
-  # or edge click for "Align Gizmo XY to Face" / "Align Gizmo X to Edge",
-  # then pops itself: on a successful pick (handed off to the overlay's own
-  # apply_face_alignment/apply_edge_alignment, which does the actual
-  # licensed Undo-wrapped write), or on Esc (onCancel, reason 0 -- no Undo
-  # entry, nothing ever changed). A click that misses -- the wrong object,
-  # the wrong kind of leaf, or empty space -- simply leaves the picker
-  # active so the user can try again without reopening the menu; only Esc
-  # (or right-click, which SketchUp itself routes to onCancel/deactivate
-  # for a tool with no context menu of its own) actually cancels.
-  class OrientationPickerTool
-    def initialize(overlay, mode, entity)
-      @overlay = overlay
-      @mode = mode
-      @entity = entity
-    end
-
-    def activate
-      Sketchup.set_status_text(status_text)
-    end
-
-    def resume(_view)
-      Sketchup.set_status_text(status_text)
-    end
-
-    def status_text
-      if @mode == :face
-        'Click a face on the selected object to align the gizmo. Press Esc to cancel.'
-      else
-        'Click a straight edge on the selected object to set gizmo X. Press Esc to cancel.'
-      end
-    end
-
-    # A pushed tool that never opens its own start_operation; onCancel
-    # (reason 0 == the user pressed Escape) is SketchUp's own documented way
-    # to detect that here. Nothing was ever changed, so there is nothing to
-    # undo -- finish_orientation_picker only pops the tool and restores the
-    # gizmo's visibility, exactly as it does for a successful pick.
-    def onCancel(_reason, view)
-      @overlay.finish_orientation_picker(view)
-    end
-
-    # Keeps the target instance closed: without this override, a native
-    # double-click default could enter its edit context out from under the
-    # picker.
-    def onLButtonDoubleClick(_flags, _x, _y, _view)
-      true
-    end
-
-    def onLButtonUp(_flags, x, y, view)
-      hit = view.model.raytest(view.pickray(x, y), false)
-      return unless hit
-
-      position, path = hit
-      return if path.nil? || path.empty?
-      return unless path.first == @entity
-
-      leaf = path.last
-      handled = if @mode == :face
-        leaf.is_a?(Sketchup::Face) && @overlay.apply_face_alignment(@entity, path, position)
-      else
-        leaf.is_a?(Sketchup::Edge) && @overlay.apply_edge_alignment(@entity, path)
-      end
-
-      @overlay.finish_orientation_picker(view) if handled
     end
   end
 end

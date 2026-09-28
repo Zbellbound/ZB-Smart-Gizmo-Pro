@@ -1245,6 +1245,12 @@ module Sketchup
     # actually requested (real Sketchup::View#invalidate has no return
     # value or other observable effect to assert on instead).
     attr_accessor :invalidate_count
+    # Test-double-only: a spec preconfigures this before driving a mouse
+    # event, and InputPoint#pick (below) resolves to it -- the same role
+    # FakePickModel's raytest hit played for the earlier face/edge picker,
+    # but scoped to the view so real Sketchup::View/InputPoint objects can
+    # be exercised instead of a one-off per-test fake.
+    attr_accessor :next_input_point
 
     def initialize(model = nil)
       @model = model
@@ -1257,6 +1263,53 @@ module Sketchup
     end
 
     def tooltip=(_value)
+      nil
+    end
+  end
+
+  # Real Sketchup::InputPoint: the standard SketchUp tool-authoring pattern
+  # for point-picking with real vertex/edge/midpoint inference, on-screen
+  # markers (#draw) and tooltips (#tooltip) -- used here instead of a plain
+  # Model#raytest so "Set Gizmo Orientation by 3 Points" gets real snapping.
+  # #pick resolves from the view's preconfigured `next_input_point` (a Hash
+  # with :position, :instance_path, and optionally :valid/:tooltip), since
+  # simulating SketchUp's real inference engine is out of scope for this
+  # test double.
+  class InputPoint
+    attr_reader :position, :instance_path
+
+    def initialize
+      @position = nil
+      @instance_path = nil
+      @valid = false
+      @tooltip = ''
+    end
+
+    def pick(view, _x, _y, _second_point = nil)
+      resolved = view.respond_to?(:next_input_point) ? view.next_input_point : nil
+      if resolved
+        @position = resolved[:position]
+        @instance_path = resolved[:instance_path]
+        @valid = resolved.fetch(:valid, true)
+        @tooltip = resolved.fetch(:tooltip, '')
+      else
+        @position = nil
+        @instance_path = nil
+        @valid = false
+        @tooltip = ''
+      end
+      self
+    end
+
+    def valid?
+      @valid
+    end
+
+    def tooltip
+      @tooltip
+    end
+
+    def draw(_view)
       nil
     end
   end
@@ -1428,6 +1481,18 @@ module Sketchup
     self.last_vcb_value = value
   end
   def self.send_action(_action); end
+
+  # Real Sketchup.set_status_text(text, sb = SB_PROMPT) sets the status bar
+  # prompt; recorded here purely so a spec can assert a picker actually
+  # updated its prompt between stages.
+  class << self
+    attr_accessor :last_status_text
+  end
+
+  def self.set_status_text(text, _sb = nil)
+    self.last_status_text = text
+    nil
+  end
 
   # Real Sketchup.format_length(number, precision = nil): "formats a
   # number as a length using the current units settings" (confirmed
