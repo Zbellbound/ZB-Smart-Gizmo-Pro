@@ -577,6 +577,19 @@ module Zbellbound::SmartGizmoPro
     def tool_changed(tool_name)
       return unless enabled?
 
+      # A pending orientation-picker restore (see finish_orientation_picker)
+      # is handled FIRST, before @native_tool_override is even recomputed --
+      # this notification firing at all, after we've already popped
+      # OrientationPickerTool, IS SketchUp's own confirmation that it's no
+      # longer the active tool, and that confirmation must not be lost to
+      # (or delayed behind) the ordinary allow-list recompute below, which
+      # could otherwise re-set @native_tool_override before the gizmo is
+      # ever actually shown again.
+      if @pending_orientation_picker_restore
+        complete_orientation_picker_restore(tool_name)
+        return
+      end
+
       @current_tool_name = tool_name
       @native_tool_override = !gizmo_allowed_for_tool?(tool_name)
 
@@ -931,6 +944,21 @@ module Zbellbound::SmartGizmoPro
     end
 
     # -- Custom gizmo orientation (Align Gizmo XY to Face / X to Edge / Reset) -
+    #
+    # Popping OrientationPickerTool does not, by itself, tell us it has
+    # actually stopped being SketchUp's active tool -- that confirmation is
+    # ToolsObserver#onActiveToolChanged (tool_changed below), and it is
+    # delivered on SketchUp's own schedule, not synchronously inside
+    # pop_tool. A fixed deferred delay (tried and observed to fail live: it
+    # left the gizmo hidden until the user's next click) is not a
+    # substitute for that confirmation, so the real fix is event-driven:
+    # finish_orientation_picker only pops the tool and records that a
+    # restore is pending; the actual restore (gizmo, active_gizmo, view)
+    # happens once tool_changed actually fires. A bounded, self-cancelling
+    # chain of rechecks exists only as a last-resort safety net for the
+    # (abnormal) case where that notification never arrives at all.
+
+    ORIENTATION_PICKER_FALLBACK_DELAYS = [0.05, 0.2, 0.5].freeze
 
     # Pushes a small picker Tool (see OrientationPickerTool below) that
     # collects one face or edge click belonging to the selected instance,
@@ -949,48 +977,80 @@ module Zbellbound::SmartGizmoPro
         "Click a straight edge on the selected object to set gizmo X. Press Esc to cancel."
       end
       Sketchup.set_status_text(instruction)
-      @model.tools.push_tool(OrientationPickerTool.new(self, mode, entity))
+      @orientation_picker = OrientationPickerTool.new(self, mode, entity)
+      @model.tools.push_tool(@orientation_picker)
     end
 
     # The one completion path for OrientationPickerTool, shared by a
     # successful face alignment, a successful edge alignment, and Esc
     # cancellation alike -- whichever happened (or didn't) has already been
-    # decided by the caller before this runs. Popping the tool here is not
-    # enough by itself to make the gizmo reappear: SketchUp delivers the
-    # ToolsObserver#onActiveToolChanged notification that clears
-    # @native_tool_override asynchronously, not synchronously inside
-    # pop_tool, so drawing (or even just recomputing active_gizmo) right
-    # here can still be gated off by a @native_tool_override that hasn't
-    # been cleared yet -- that's the extra click the user had to make.
-    # Forcing the restored state directly, on a deferred zero-delay timer,
-    # fixes both problems: it no longer depends on that notification's
-    # timing, and it still runs on the next tick rather than inline.
+    # decided by the caller before this runs. Only pops the tool and marks
+    # a pending restore, tied to a fresh token (so an earlier, superseded
+    # pending restore can never complete later) and the model/selection
+    # generation active right now (so it can never apply to a model or
+    # selection that's since changed). The actual restore happens in
+    # complete_orientation_picker_restore, from tool_changed.
     def finish_orientation_picker(view)
+      return unless @orientation_picker
+
       model = view.model
       model.tools.pop_tool
-      schedule_orientation_picker_restore(model)
+      @orientation_picker = nil
+
+      token = (@orientation_picker_restore_token || 0) + 1
+      @orientation_picker_restore_token = token
+      @pending_orientation_picker_restore = { model: model, generation: @refresh_generation, token: token }
+
+      schedule_orientation_picker_restore_fallback(model, token)
     end
 
-    # Guarded by a token (only the most recently scheduled restore may run)
-    # and, when it fires, by the model and selection generation captured at
-    # schedule time -- so a restore left over from an earlier pick can never
-    # touch a model that's since been closed, a different document, or a
-    # selection that's since changed.
-    def schedule_orientation_picker_restore(model)
-      token = (@orientation_picker_token || 0) + 1
-      @orientation_picker_token = token
-      generation = @refresh_generation
+    # The authoritative completion, run from tool_changed the moment
+    # SketchUp itself reports that the active tool changed (which, since
+    # OrientationPickerTool was already popped by finish_orientation_picker,
+    # can only mean it's no longer active) -- never guessed, and identified
+    # by this specific pending restore's token rather than by tool_name, so
+    # an unrelated or stale tool change can never trigger or interfere with
+    # it. Selection and any stored custom orientation are untouched; this
+    # only ever restores visibility.
+    def complete_orientation_picker_restore(tool_name)
+      return unless enabled?
 
-      UI.start_timer(0, false) do
-        next if token != @orientation_picker_token
+      pending = @pending_orientation_picker_restore
+      return unless pending
+      return unless pending[:model] == @model && @model&.valid?
+      return unless pending[:generation] == @refresh_generation
+
+      @pending_orientation_picker_restore = nil
+      @native_tool_override = false
+      @current_tool_name = tool_name
+      self.active_gizmo = enabled? && selection_present?
+      update_gizmo
+      @model.active_view.invalidate if @model&.active_view
+    end
+
+    # Last-resort safety net for the abnormal case where
+    # ToolsObserver#onActiveToolChanged never fires at all: a short, bounded
+    # chain of rechecks (never a single guessed delay) that only ever acts
+    # on ITS OWN token, so a later pick, a model change, or a selection
+    # change safely stops it from doing anything. Each step re-checks
+    # whether the real event has already completed the restore (i.e.
+    # whether a pending restore for this token still exists) before either
+    # rescheduling the next, closer check or -- only on the very last one --
+    # forcing the same restore tool_changed would have done.
+    def schedule_orientation_picker_restore_fallback(model, token, attempt = 0)
+      delay = ORIENTATION_PICKER_FALLBACK_DELAYS[attempt]
+      return unless delay
+
+      UI.start_timer(delay, false) do
+        pending = @pending_orientation_picker_restore
+        next unless pending && pending[:token] == token
         next unless model && model == @model && model.valid?
-        next unless generation == @refresh_generation
 
-        @native_tool_override = false
-        @current_tool_name = nil
-        self.active_gizmo = enabled? && selection_present?
-        update_gizmo
-        model.active_view.invalidate
+        if attempt == ORIENTATION_PICKER_FALLBACK_DELAYS.length - 1
+          complete_orientation_picker_restore(@current_tool_name)
+        else
+          schedule_orientation_picker_restore_fallback(model, token, attempt + 1)
+        end
       end
     end
 

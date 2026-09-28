@@ -1241,12 +1241,18 @@ module Sketchup
 
   class View
     attr_accessor :model
+    # Test-double-only call counter, so a spec can prove a repaint was
+    # actually requested (real Sketchup::View#invalidate has no return
+    # value or other observable effect to assert on instead).
+    attr_accessor :invalidate_count
 
     def initialize(model = nil)
       @model = model
+      @invalidate_count = 0
     end
 
     def invalidate
+      @invalidate_count += 1
       nil
     end
 

@@ -339,51 +339,56 @@ class CustomGizmoOrientationTest < Minitest::Test
     assert_equal %i[start commit start commit], @model.operation_log.map(&:first)
   end
 
-  # -- Picker completion: finish_orientation_picker / deferred restore -----
+  # -- Picker completion: event-driven restore via tool_changed -------------
   #
   # Regression coverage for the bug where the gizmo stayed hidden after a
-  # successful face/edge pick until the user made one extra click. Root
-  # cause: SketchUp delivers the ToolsObserver#onActiveToolChanged
-  # notification that clears @native_tool_override asynchronously, not
-  # synchronously inside pop_tool -- so recomputing gizmo visibility right
-  # after popping the picker tool could still see it as hidden.
-  # finish_orientation_picker always pops the tool immediately but defers
-  # the actual restore to a zero-delay UI.start_timer (UI.timer_blocks in
-  # this test double), by which point that notification, if any, has
-  # already been delivered.
+  # successful face/edge pick (or Esc) until the user made one extra click.
+  # A zero-delay timer (tried first) was NOT a reliable fix: it forced the
+  # restore inline without ever confirming SketchUp had actually finished
+  # deactivating OrientationPickerTool, and live testing showed the gizmo
+  # still stayed hidden. The real fix is event-driven: finish_orientation_
+  # picker only pops the tool and marks a pending restore; the actual
+  # restore only happens once SketchUp's own ToolsObserver#onActiveTool
+  # Changed notification arrives, via tool_changed -> complete_orientation_
+  # picker_restore. A short, bounded chain of rechecks (UI.timer_blocks in
+  # this test double) exists only as a safety net for the notification
+  # never arriving at all -- it is not the primary completion path.
 
-  def push_fake_picker(overlay, entity, mode = :face)
+  def push_picker(overlay, entity, mode = :face)
     tool = P::OrientationPickerTool.new(overlay, mode, entity)
+    overlay.instance_variable_set(:@orientation_picker, tool)
     @model.tools.push_tool(tool)
     tool
   end
 
-  def test_a_successful_face_pick_exits_the_picker_and_schedules_a_gizmo_restore
+  def test_a_successful_face_pick_pops_the_tool_and_leaves_the_gizmo_pending_until_tool_changed
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
     overlay.enabled = true
-    push_fake_picker(overlay, g, :face)
+    push_picker(overlay, g, :face)
     overlay.instance_variable_set(:@native_tool_override, true)
     face, p0, p1, = build_diamond_top_face
 
     assert overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
     overlay.finish_orientation_picker(@model.active_view)
 
-    assert_nil @model.tools.active_tool, 'the picker tool must be popped immediately, not deferred'
-    assert overlay.instance_variable_get(:@native_tool_override), 'the actual restore is deferred, not inline'
-    assert_equal 1, UI.timer_blocks.length, 'exactly one deferred restore is scheduled'
+    assert_nil @model.tools.active_tool, 'the picker tool must be popped immediately'
+    assert overlay.instance_variable_get(:@pending_orientation_picker_restore), 'a restore must now be pending'
+    assert overlay.instance_variable_get(:@native_tool_override), 'the gizmo must stay pending -- no inline restore'
+    refute overlay.active_gizmo
 
-    UI.timer_blocks.last.call
+    overlay.tool_changed('SelectionTool')
 
-    refute overlay.instance_variable_get(:@native_tool_override), 'the deferred restore clears the override'
+    assert_nil overlay.instance_variable_get(:@pending_orientation_picker_restore)
+    refute overlay.instance_variable_get(:@native_tool_override), 'tool_changed completes the restore'
     assert overlay.active_gizmo, 'the gizmo must be visible again without any further click'
   end
 
-  def test_a_successful_edge_pick_exits_the_picker_and_schedules_a_gizmo_restore
+  def test_a_successful_edge_pick_also_completes_only_via_tool_changed
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
     overlay.enabled = true
-    push_fake_picker(overlay, g, :edge)
+    push_picker(overlay, g, :edge)
     overlay.instance_variable_set(:@native_tool_override, true)
     edge = Sketchup::Edge.new(Geom::Point3d.new(0, 0, 0), Geom::Point3d.new(1, 0, 0))
 
@@ -391,32 +396,19 @@ class CustomGizmoOrientationTest < Minitest::Test
     overlay.finish_orientation_picker(@model.active_view)
 
     assert_nil @model.tools.active_tool
-    assert_equal 1, UI.timer_blocks.length
+    assert overlay.instance_variable_get(:@native_tool_override), 'still pending -- not restored inline'
 
-    UI.timer_blocks.last.call
+    overlay.tool_changed('SelectionTool')
 
     refute overlay.instance_variable_get(:@native_tool_override)
     assert overlay.active_gizmo
   end
 
-  def test_the_selected_object_remains_selected_through_the_whole_picker_flow
-    g = TestFixtures.group_box
-    overlay = build_overlay_with(g)
-    push_fake_picker(overlay, g, :face)
-    face, p0, p1, = build_diamond_top_face
-
-    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
-    overlay.finish_orientation_picker(@model.active_view)
-    UI.timer_blocks.last.call
-
-    assert_equal [g], @model.selection.to_a, 'the picker flow must never change the selection'
-  end
-
-  def test_esc_restores_the_gizmo_immediately_without_changing_orientation_or_undo
+  def test_esc_pops_immediately_with_no_undo_and_also_completes_only_via_tool_changed
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
     overlay.enabled = true
-    tool = push_fake_picker(overlay, g, :face)
+    tool = push_picker(overlay, g, :face)
     overlay.instance_variable_set(:@native_tool_override, true)
     refute CO.stored?(g)
 
@@ -424,68 +416,172 @@ class CustomGizmoOrientationTest < Minitest::Test
 
     assert_nil @model.tools.active_tool, 'Esc must pop the picker immediately'
     assert_empty @model.operation_log, 'Esc must never open an Undo operation'
-    assert overlay.instance_variable_get(:@native_tool_override), 'the restore is still deferred at this point'
+    assert overlay.instance_variable_get(:@native_tool_override), 'the restore is still pending at this point'
 
-    UI.timer_blocks.last.call
+    overlay.tool_changed('SelectionTool')
 
     refute CO.stored?(g), 'Esc must not create a custom orientation'
     refute overlay.instance_variable_get(:@native_tool_override), 'Esc must restore the gizmo without a further click'
     assert overlay.active_gizmo
   end
 
-  def test_finishing_the_picker_never_opens_an_additional_undo_operation
+  def test_the_selected_object_and_custom_orientation_survive_the_whole_picker_and_restore_flow
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
-    push_fake_picker(overlay, g, :face)
+    overlay.enabled = true
+    push_picker(overlay, g, :face)
+    face, p0, p1, = build_diamond_top_face
+
+    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    world_x_before, = CO.world_axes_for(g)
+    overlay.finish_orientation_picker(@model.active_view)
+    overlay.tool_changed('SelectionTool')
+
+    assert_equal [g], @model.selection.to_a, 'the picker flow must never change the selection'
+    world_x_after, = CO.world_axes_for(g)
+    assert_in_delta 1.0, world_x_before.dot(world_x_after), 1e-9, 'the restore itself must never touch the stored orientation'
+  end
+
+  def test_the_view_is_invalidated_once_tool_changed_completes_the_restore
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.enabled = true
+    push_picker(overlay, g, :face)
+    face, p0, p1, = build_diamond_top_face
+    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    overlay.finish_orientation_picker(@model.active_view)
+    invalidations_before = @model.active_view.invalidate_count
+
+    overlay.tool_changed('SelectionTool')
+
+    assert_operator @model.active_view.invalidate_count, :>, invalidations_before
+  end
+
+  def test_finishing_and_completing_the_picker_never_opens_an_additional_undo_operation
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.enabled = true
+    push_picker(overlay, g, :face)
     face, p0, p1, = build_diamond_top_face
 
     overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
     log_after_align = @model.operation_log.dup
 
     overlay.finish_orientation_picker(@model.active_view)
-    UI.timer_blocks.last.call
+    overlay.tool_changed('SelectionTool')
 
     assert_equal log_after_align, @model.operation_log,
       'popping the picker and restoring the gizmo must never start a second Undo operation'
   end
 
-  def test_a_stale_deferred_restore_is_ignored_and_only_the_latest_one_applies
+  def test_an_unrelated_tool_change_with_nothing_pending_does_not_touch_the_picker_state
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
-    push_fake_picker(overlay, g, :face)
+    overlay.enabled = true
+    refute overlay.instance_variable_get(:@pending_orientation_picker_restore)
+
+    overlay.tool_changed('MoveTool') # an ordinary, unrelated tool change
+
+    assert_nil overlay.instance_variable_get(:@pending_orientation_picker_restore)
+    assert overlay.instance_variable_get(:@native_tool_override), 'ordinary tool_changed logic must still run unchanged'
+  end
+
+  def test_a_tool_changed_notification_after_the_restore_already_completed_is_a_harmless_no_op
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.enabled = true
+    push_picker(overlay, g, :face)
+    face, p0, p1, = build_diamond_top_face
+    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    overlay.finish_orientation_picker(@model.active_view)
+    overlay.tool_changed('SelectionTool')
+    assert overlay.active_gizmo
+
+    overlay.tool_changed('SelectionTool') # a second, stale notification
+
+    assert_equal [g], @model.selection.to_a
+    refute overlay.instance_variable_get(:@native_tool_override)
+  end
+
+  # -- Bounded fallback: only for the abnormal case tool_changed never fires
+
+  def test_the_first_bounded_fallback_tick_leaves_the_restore_pending
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    push_picker(overlay, g, :face)
+    face, p0, p1, = build_diamond_top_face
+    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
     overlay.instance_variable_set(:@native_tool_override, true)
 
+    overlay.finish_orientation_picker(@model.active_view)
+    assert_equal 1, UI.timer_blocks.length, 'only the next check is scheduled, not the whole bounded chain at once'
+
+    UI.timer_blocks.last.call # first (0.05s) recheck: not the last attempt
+
+    assert overlay.instance_variable_get(:@pending_orientation_picker_restore), 'still pending -- not yet forced'
+    assert overlay.instance_variable_get(:@native_tool_override)
+    assert_equal 2, UI.timer_blocks.length, 'the next bounded recheck is scheduled'
+  end
+
+  def test_the_bounded_fallback_eventually_forces_the_restore_if_tool_changed_never_arrives
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.enabled = true
+    push_picker(overlay, g, :face)
+    face, p0, p1, = build_diamond_top_face
+    overlay.apply_face_alignment(g, [g, face], Geom::Point3d.new((p0.x + p1.x) / 2, (p0.y + p1.y) / 2, p0.z))
+    overlay.instance_variable_set(:@native_tool_override, true)
+
+    overlay.finish_orientation_picker(@model.active_view)
+    # Walk the whole bounded chain -- tool_changed is never simulated here.
+    # Each fired block may itself schedule one more (closer) recheck, so
+    # keep firing the newest one until the pending restore is gone.
+    while overlay.instance_variable_get(:@pending_orientation_picker_restore)
+      before = UI.timer_blocks.length
+      UI.timer_blocks.last.call
+      break if UI.timer_blocks.length == before && overlay.instance_variable_get(:@pending_orientation_picker_restore)
+    end
+
+    refute overlay.instance_variable_get(:@native_tool_override), 'the last bounded recheck forces the restore'
+    assert overlay.active_gizmo
+  end
+
+  def test_a_stale_fallback_from_a_superseded_picker_session_is_ignored
+    g = TestFixtures.group_box
+    overlay = build_overlay_with(g)
+    overlay.enabled = true
+    push_picker(overlay, g, :face)
+    overlay.instance_variable_set(:@native_tool_override, true)
     overlay.finish_orientation_picker(@model.active_view)
     stale_block = UI.timer_blocks.last
 
-    push_fake_picker(overlay, g, :face)
-    overlay.instance_variable_set(:@native_tool_override, true)
+    # A newer picker session starts and finishes before the stale fallback
+    # from the first one ever fires (e.g. Esc right after a face-align).
+    push_picker(overlay, g, :face)
     overlay.finish_orientation_picker(@model.active_view)
-    fresh_block = UI.timer_blocks.last
-    refute_same stale_block, fresh_block
 
     stale_block.call
-    assert overlay.instance_variable_get(:@native_tool_override), 'a superseded restore must be a no-op'
+    assert overlay.instance_variable_get(:@pending_orientation_picker_restore),
+      'a fallback tied to a superseded session must never touch the newer one'
 
-    fresh_block.call
-    refute overlay.instance_variable_get(:@native_tool_override), 'the latest scheduled restore still applies'
+    overlay.tool_changed('SelectionTool')
+    refute overlay.instance_variable_get(:@native_tool_override), 'the newer session still restores normally'
   end
 
-  def test_a_deferred_restore_is_ignored_once_the_overlay_has_moved_to_another_model
+  def test_a_pending_restore_is_abandoned_once_the_overlay_has_moved_to_another_model
     g = TestFixtures.group_box
     overlay = build_overlay_with(g)
+    overlay.enabled = true
     original_model = @model
-    push_fake_picker(overlay, g, :face)
+    push_picker(overlay, g, :face)
     overlay.instance_variable_set(:@native_tool_override, true)
-
     overlay.finish_orientation_picker(original_model.active_view)
-    block = UI.timer_blocks.last
 
     overlay.instance_variable_set(:@model, Sketchup::Model.new)
 
-    block.call
+    overlay.tool_changed('SelectionTool') # delivered for the OLD model's tool stack
     assert overlay.instance_variable_get(:@native_tool_override),
-      'a restore scheduled for a since-abandoned model must not fire against the new one'
+      'a restore pending for a since-abandoned model must not fire against the new one'
   end
 
   # -- gizmo_state_for_current_selection / Global-mode isolation -----------
