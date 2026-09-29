@@ -6,23 +6,45 @@ then again after the folder was cleaned up post-release.
 
 ## Current contents
 
-**Updated 2026-09-29** — **1.5.5 is the production candidate for `ZB Smart Gizmo Pro`, pending build
-and independent verification of the release package.** It adds custom per-instance gizmo
-orientation: right-click the gizmo (exactly one Group/ComponentInstance selected) for
-`Set Gizmo Orientation by 3 Points...` (three clicks -- an orientation-reference origin, a
-positive-X point, and a positive-Y-side point -- define an orthonormal, right-handed basis; the
-first click never moves the pivot or the object) and `Reset Gizmo Orientation to Object Axes`. The
-custom orientation is stored per instance (a shared component's other instances are unaffected),
-follows the object through later moves/rotations/copies, stays valid and right-handed on mirrored
-or non-uniformly-scaled instances, applies only in Object orientation (Global is unaffected), and
-is used consistently by Move/Rotate/Scale/Smart Scale/arrays/re-editing. The picker runs entirely
-inside the gizmo overlay's own existing callbacks rather than pushing a separate SketchUp tool, so
-the gizmo is visible again immediately after finishing a pick or pressing Esc, with no tool-stack
-restoration workaround needed. `PLUGIN_NAME`, `PLUGIN_ID`, the Extension Warehouse UUID, the
-preference namespace, and every existing default (Handle Size 80, Smart Scale Yes) and behavior are
-unchanged from 1.5.4. Confirmed via Peter's own live SketchUp test of the feature (build labelled
-DEV/license-bypass, local-only, never committed) before this production candidate was merged
-(`feature/custom-gizmo-orientation`, merge commit `2698559`) and cut.
+**Updated 2026-09-29** — **1.5.5 is the approved, verified production package for
+`ZB Smart Gizmo Pro`.** It adds custom per-instance gizmo orientation: right-click the gizmo
+(exactly one Group/ComponentInstance selected) for `Set Gizmo Orientation by 3 Points...` (three
+clicks -- an orientation-reference origin, a positive-X point, and a positive-Y-side point --
+define an orthonormal, right-handed basis; the first click never moves the pivot or the object)
+and `Reset Gizmo Orientation to Object Axes`. The custom orientation is stored per instance (a
+shared component's other instances are unaffected), follows the object through later
+moves/rotations/copies, stays valid and right-handed on mirrored or non-uniformly-scaled
+instances, applies only in Object orientation (Global is unaffected), and is used consistently by
+Move/Rotate/Scale/Smart Scale/arrays/re-editing. The picker runs entirely inside the gizmo
+overlay's own existing callbacks rather than pushing a separate SketchUp tool, so the gizmo is
+visible again immediately after finishing a pick or pressing Esc, with no tool-stack restoration
+workaround needed. `PLUGIN_NAME`, `PLUGIN_ID`, the Extension Warehouse UUID, the preference
+namespace, and every existing default (Handle Size 80, Smart Scale Yes) and behavior are unchanged
+from 1.5.4. Confirmed via Peter's own live SketchUp test of the feature (a local-only,
+DEV/license-bypass-labelled build, never committed) before `feature/custom-gizmo-orientation` was
+merged into `main` (merge commit `2698559`) and cut as `f527d57` ("Bump version to 1.5.5, mark
+Release/README.md 1.5.5 as production candidate").
+
+- **`ZB_Smart_Gizmo_Pro_1.5.5_Warehouse_Final.rbz`** (207,941 B) — **the approved 1.5.5 release
+  artifact.** Built directly from the committed blobs of production commit `f527d57` -- every one
+  of its 11 packaged files is byte-identical to that commit, with no patching of any kind (unlike
+  the local DEV/bypass test builds used for live testing, which patch only a temporary staged
+  copy and are never committed). 11 entries: the ten 1.5.4 runtime files plus
+  `zb_smart_gizmo_pro/custom_orientation.rb`. Passed the full Zbellbound release gate (314 tests /
+  2560 assertions, 0 failures; `ruby -c` on all 8 shipped Ruby files; both RuboCop-SketchUp gates
+  at 0 offenses, the FileStructure one run against an isolated extraction of this exact package;
+  extensionless-`Sketchup.require` and load-order audit; version-consistency audit (`1.5.5` exact,
+  no DEV/RC label, `extension.version = PLUGIN_VERSION`); namespace/registration/preference-key
+  audit; licensing UUID/activation-route audit confirming a real, non-bypassed license check;
+  console-output and rescue-clause review; vector-icon/platform audit (SVG/PDF/PNG headers valid);
+  package-content hygiene -- no `.lic`, signature, test files, stale identity, or DEV/bypass text
+  anywhere in the package). Feature-specific confirmation: `Set Gizmo Orientation by 3 Points...`
+  and `Reset Gizmo Orientation to Object Axes` are present, the old `Align Gizmo XY to Face...`/
+  `Align Gizmo X to Edge...` commands and the `OrientationPickerTool` class and its tool-stack
+  restoration workaround are entirely gone, and `Handle Size 80`/`Smart Scale Yes` defaults are
+  preserved. Not yet tagged, pushed, released, or submitted to the Extension Warehouse --
+  pending Peter's approval.
+  `d158da1fe64375e1dd1435778ba4b6b6c6eadd30f408c980d2f1e7256327e3ee`
 
 **Updated 2026-09-21** — **1.5.4 is the approved, published production package for `ZB Smart Gizmo Pro`.** It adds
 Extension Warehouse licensing to the Pro identity, reusing the approved ZB Smart Bevel v1.13
