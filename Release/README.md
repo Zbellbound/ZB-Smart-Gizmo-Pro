@@ -6,6 +6,24 @@ then again after the folder was cleaned up post-release.
 
 ## Current contents
 
+**Updated 2026-09-29** — **1.5.5 is the production candidate for `ZB Smart Gizmo Pro`, pending build
+and independent verification of the release package.** It adds custom per-instance gizmo
+orientation: right-click the gizmo (exactly one Group/ComponentInstance selected) for
+`Set Gizmo Orientation by 3 Points...` (three clicks -- an orientation-reference origin, a
+positive-X point, and a positive-Y-side point -- define an orthonormal, right-handed basis; the
+first click never moves the pivot or the object) and `Reset Gizmo Orientation to Object Axes`. The
+custom orientation is stored per instance (a shared component's other instances are unaffected),
+follows the object through later moves/rotations/copies, stays valid and right-handed on mirrored
+or non-uniformly-scaled instances, applies only in Object orientation (Global is unaffected), and
+is used consistently by Move/Rotate/Scale/Smart Scale/arrays/re-editing. The picker runs entirely
+inside the gizmo overlay's own existing callbacks rather than pushing a separate SketchUp tool, so
+the gizmo is visible again immediately after finishing a pick or pressing Esc, with no tool-stack
+restoration workaround needed. `PLUGIN_NAME`, `PLUGIN_ID`, the Extension Warehouse UUID, the
+preference namespace, and every existing default (Handle Size 80, Smart Scale Yes) and behavior are
+unchanged from 1.5.4. Confirmed via Peter's own live SketchUp test of the feature (build labelled
+DEV/license-bypass, local-only, never committed) before this production candidate was merged
+(`feature/custom-gizmo-orientation`, merge commit `2698559`) and cut.
+
 **Updated 2026-09-21** — **1.5.4 is the approved, published production package for `ZB Smart Gizmo Pro`.** It adds
 Extension Warehouse licensing to the Pro identity, reusing the approved ZB Smart Bevel v1.13
 pattern: SketchUp's own `Sketchup::Licensing` API is the only source of truth (no Zbellbound

@@ -516,7 +516,7 @@ module Zbellbound
                 <div class="card">
                   <h3>Right-Click Menu</h3>
                   <ul>
-                    <li><code>Set Gizmo Orientation by 3 Points...</code> -- click origin, then positive X, then a point on the positive-Y side; Object orientation switches on automatically once all three are picked.</li>
+                    <li><code>Set Gizmo Orientation by 3 Points...</code> -- click origin (a reference point only; it does not move the gizmo's pivot), then positive X, then a point on the positive-Y side; Object orientation switches on automatically once all three are picked.</li>
                     <li>Point 2 can't coincide with point 1, and point 3 can't be collinear with points 1 and 2 -- either is rejected with a short message so you can just click again.</li>
                     <li>Backspace steps back one picked point; Esc cancels the whole operation with no change to the model.</li>
                     <li><code>Reset Gizmo Orientation to Object Axes</code> -- removes the custom orientation.</li>
