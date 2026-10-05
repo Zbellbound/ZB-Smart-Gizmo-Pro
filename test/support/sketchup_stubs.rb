@@ -998,9 +998,16 @@ module Sketchup
     end
 
     def transform_entities(transformation, entities)
+      moved_vertices = []
       Array(entities).each do |e|
-        e.transformation = transformation * e.transformation if e.respond_to?(:transformation=)
+        if e.is_a?(Edge)
+          # Real SketchUp moves each shared vertex once, with its edges.
+          e.vertices.each { |v| moved_vertices << v unless moved_vertices.any? { |m| m.equal?(v) } }
+        elsif e.respond_to?(:transformation=)
+          e.transformation = transformation * e.transformation
+        end
       end
+      moved_vertices.each { |v| v.position = v.position.transform(transformation) }
       true
     end
 

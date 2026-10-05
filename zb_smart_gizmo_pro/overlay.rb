@@ -74,12 +74,16 @@ module Zbellbound::SmartGizmoPro
   class SmartScaleGestureState
     attr_reader :entity, :axis_id, :profile, :reference_length, :vertex_entries,
                 :instance_entries, :mask, :ratio, :mode, :original_entity_transformation,
-                :anchor_point, :gizmo_transformation, :root_to_solver_transformation
+                :anchor_point, :gizmo_transformation, :root_to_solver_transformation, :zone, :curve_entries
+    attr_accessor :aborted
 
     def initialize(entity:, axis_id:, profile:, reference_length:, vertex_entries:, instance_entries:, mask:,
                    mode: :frame, original_entity_transformation: nil, anchor_point: nil, gizmo_transformation: nil,
-                   root_to_solver_transformation: IDENTITY)
+                   root_to_solver_transformation: IDENTITY, zone: false, curve_entries: [])
       @entity = entity
+      @zone = zone
+      @curve_entries = curve_entries.freeze
+      @aborted = false
       @axis_id = axis_id
       @profile = profile
       @reference_length = reference_length
@@ -98,6 +102,7 @@ module Zbellbound::SmartGizmoPro
       return false unless @entity&.valid?
 
       vertex_entries.all? { |entry| entry[:vertex].valid? } &&
+        curve_entries.all? { |unit| unit[:edges].all?(&:valid?) } &&
         instance_entries.all? do |entry|
           entry[:instance].valid? &&
             (!entry[:nested_state] || entry[:nested_state].valid?)
@@ -130,6 +135,15 @@ module Zbellbound::SmartGizmoPro
         next if payload[:vertices].empty?
 
         entities.transform_by_vectors(payload[:vertices], payload[:vectors])
+      end
+
+      # Saved-zone curves were moved as rigid units: move each back whole.
+      curve_entries.each do |unit|
+        next unless unit[:applied]
+
+        unit[:entities].transform_entities(unit[:applied].inverse, unit[:edges]) if unit[:edges].all?(&:valid?)
+        unit[:applied] = nil
+        unit[:applied_shift] = 0.0
       end
 
       instance_entries.each do |entry|
@@ -193,7 +207,16 @@ module Zbellbound::SmartGizmoPro
       return false if state.mode == :basic && ratio == 0.0
       return false unless ratio.positive? || state.mode == :basic
 
-      state.restore!
+      # A saved-zone gesture that failed validation stays aborted: nothing
+      # more is written for it (see zone_write_back_valid?).
+      return false if state.aborted
+
+      # Saved-zone gestures never restore-then-rewrite: every target comes
+      # from the immutable original snapshot and each owner is written ONCE
+      # per frame, straight from where its vertices are now. (A restore pass
+      # first would write the same connected vertices twice per frame, and
+      # in a real model every write re-evaluates connected curves and faces.)
+      state.restore! unless state.zone
 
       if state.mode == :basic
         data = [:scale, nil, ratio, state.mask, state.reference_length, state.anchor_point, state.gizmo_transformation]
@@ -214,13 +237,24 @@ module Zbellbound::SmartGizmoPro
       new_inner = old_inner + delta
       return false if new_inner <= 0
 
+      # Saved zone, zero stretch: nothing to compute and nothing to write.
+      # restore! only touches vertices that are not already at their original
+      # position, so a gesture sitting at ratio 1.0 performs no geometry write.
+      if state.zone && delta.abs < 1e-12
+        state.restore!
+        overlay.invalidate_smart_scale_bounds(state)
+        state.ratio = ratio
+        return true
+      end
+
       stretch_factor = new_inner / old_inner.to_f
       entity_vertex_map = Hash.new { |hash, key| hash[key] = { vertices: [], vectors: [] } }
 
       state.vertex_entries.each do |entry|
         next unless entry[:vertex].valid?
 
-        value = overlay.point_axis_value(entry[:original_root_point], state.axis_id)
+        actual = overlay.point_axis_value(entry[:original_root_point], state.axis_id)
+        value = actual
         new_value = if value <= profile[:inner_min]
           value
         elsif value >= profile[:inner_max]
@@ -232,6 +266,16 @@ module Zbellbound::SmartGizmoPro
 
         target_root = overlay.point_with_axis_value(entry[:original_root_point], state.axis_id, new_value)
         target_local = overlay.transform_solver_point_to_root(target_root, state.root_to_solver_transformation)
+        if entry[:local_to_root]
+          target_local = target_local.transform(entry[:local_to_root].inverse)
+          # Saved-zone candidate check BEFORE anything is written: carrying
+          # the candidate local point forward again must land on the target
+          # solver point (catches mirrored / sheared / degenerate transforms).
+          unless overlay.zone_candidate_valid?(entry, target_root, target_local, state)
+            state.aborted = true
+            return false
+          end
+        end
         current_local = entry[:vertex].position
         next if current_local == target_local
 
@@ -243,6 +287,23 @@ module Zbellbound::SmartGizmoPro
         next if payload[:vertices].empty?
 
         entities.transform_by_vectors(payload[:vertices], payload[:vectors])
+      end
+
+      # Saved-zone curves: never deformed, never written vertex by vertex.
+      # Each curve (with every vertex it shares with other edges) is moved as
+      # ONE rigid unit by a single transform_entities call.
+      state.curve_entries.each do |unit|
+        overlay.zone_move_curve_unit(unit, state, delta, old_inner, new_inner)
+      end
+
+      # Saved-zone safety guard: every written vertex must now sit on its
+      # target (moved only along the zone axis, never absurdly far). If the
+      # model did not take the write as computed, put everything back and
+      # abort the zone gesture instead of leaving corrupted geometry.
+      if state.zone && !overlay.zone_write_back_valid?(state, ratio)
+        state.restore!
+        state.aborted = true
+        return false
       end
 
       state.instance_entries.each do |entry|
@@ -1336,6 +1397,13 @@ module Zbellbound::SmartGizmoPro
         end
         if data[0] == :scale && !smart_scale_supported?(data)
           @last_smart_scale_session = nil
+        end
+        # A saved Smart Scale Zone means the selection must NEVER be scaled
+        # uniformly as a whole: if the zone solver could not run this frame,
+        # skip the frame rather than degrade to the ordinary scale below.
+        if data[0] == :scale && smart_scale_supported?(data) && smart_scale_zone_active_for_selection?(data)
+          smart_scale_log('zone gesture could not be applied; ordinary scale suppressed')
+          next
         end
         # When smart scale was attempted but the gesture state couldn't be
         # built (e.g. object has no usable structure), fall through to the
@@ -3187,6 +3255,60 @@ module Zbellbound::SmartGizmoPro
       :unsupported
     end
 
+    # True when any selected entity has a saved zone for this gesture's axis.
+    def smart_scale_zone_active_for_selection?(data)
+      axis_id = smart_scale_axis_id(data[3])
+      return false unless axis_id
+
+      @selection.to_a.any? { |entity| smart_scale_zone_override(entity, axis_id) }
+    end
+
+    # Saved-zone geometry: every raw edge vertex at ANY nesting depth, each
+    # with the transformation that carries its local coordinates up to the
+    # selected entity's space. The one SmartScaleApplier then maps every
+    # vertex through the zone profile in solver space and writes it back in
+    # that vertex's own local coordinates -- no group/component transform is
+    # scaled, so nested assemblies stay coherent.
+    #
+    # A definition reachable through more than one instance (one that could
+    # not be made unique) is collected ONCE, through the first path. Its
+    # vertices are the same objects for every instance; listing them again
+    # with another instance's transform would apply several different
+    # vectors to one vertex and fling the geometry far from where it was.
+    def collect_zone_geometry(entities, root_to_solver_transformation, composite = nil, edges = [], entries = [], depth = 0, seen = [], curves = [])
+      return [edges, entries, curves] unless entities && depth <= 8
+
+      own_edges = entities.grep(Sketchup::Edge)
+      edges.concat(own_edges)
+      own_edges.select(&:curve).group_by(&:curve).each_value do |curve_edges|
+        curves << { entities: entities, edges: curve_edges, composite: composite }
+      end
+      own_edges.flat_map(&:vertices).uniq.each do |vertex|
+        local = vertex.position.clone
+        root_point = composite ? local.transform(composite) : local
+        entry = {
+          vertex: vertex,
+          entities: entities,
+          original_local_point: local,
+          original_root_point: transform_root_point_to_solver(root_point, root_to_solver_transformation)
+        }
+        entry[:local_to_root] = composite if composite
+        entries << entry
+      end
+
+      child_instances_for_entities(entities).each do |instance|
+        identity = instance.respond_to?(:definition) ? instance.definition : smart_scale_entities(instance)
+        if seen.any? { |other| other == identity }
+          next
+        end
+
+        seen << identity
+        child_tr = composite ? composite * instance.transformation : instance.transformation
+        collect_zone_geometry(smart_scale_entities(instance), root_to_solver_transformation, child_tr, edges, entries, depth + 1, seen, curves)
+      end
+      [edges, entries, curves]
+    end
+
     def build_smart_scale_gesture_state_for_entity(entity, axis_id, mask, data = nil, depth = 0, parent_root_to_solver = nil)
       root_entities = smart_scale_entities(entity)
       return nil unless root_entities
@@ -3202,35 +3324,52 @@ module Zbellbound::SmartGizmoPro
       # so everything beyond the stretch zone travels with the scaling; only
       # auto-detection ignores curve vertices.
       zone_override = parent_root_to_solver ? nil : smart_scale_zone_override(entity, axis_id)
-      edges = root_entities.grep(Sketchup::Edge)
-      edges = edges.reject(&:curve) unless zone_override
-
-      child_instances = collect_nested_smart_scale_instances(root_entities, axis_id, [], root_to_solver_transformation)
-
-      vertex_entries = edges.flat_map(&:vertices).uniq.map do |vertex|
-        {
-          vertex: vertex,
-          entities: root_entities,
-          original_local_point: vertex.position.clone,
-          original_root_point: transform_root_point_to_solver(vertex.position.clone, root_to_solver_transformation)
-        }
+      zone_profile = nil
+      if zone_override
+        zone_edges, zone_entries, zone_curves = collect_zone_geometry(root_entities, root_to_solver_transformation)
+        zone_points = zone_entries.map { |entry| entry[:original_root_point] }
+        zone_profile = !zone_points.empty? && smart_scale_zone_profile_with_override(axis_id, zone_points, zone_override)
       end
 
-      return nil if vertex_entries.empty? && child_instances.empty?
+      curve_units = []
+      if zone_profile
+        edges = zone_edges
+        # The curve wins: every vertex of a Curve/ArcCurve (shared ones too)
+        # leaves the stretch batch and travels with its curve as a rigid unit.
+        curve_units = zone_curve_units(zone_curves, zone_entries)
+        curve_vertices = curve_units.flat_map { |unit| unit[:vertex_entries].map { |e| e[:vertex] } }.to_h { |v| [v, true] }
+        vertex_entries = zone_entries.reject { |entry| curve_vertices[entry[:vertex]] }
+        child_instances = []
+        profile_points = zone_points
+      else
+        edges = root_entities.grep(Sketchup::Edge).reject(&:curve)
+        child_instances = collect_nested_smart_scale_instances(root_entities, axis_id, [], root_to_solver_transformation)
 
-      profile_points = vertex_entries.map { |entry| entry[:original_root_point] }
-      child_instances.each do |entry|
-        0.upto(7) do |i|
-          profile_points << transform_root_point_to_solver(
-            transform_point_by_instance_path(entry[:instance].bounds.corner(i), entry[:path] || []),
-            root_to_solver_transformation
-          )
+        vertex_entries = edges.flat_map(&:vertices).uniq.map do |vertex|
+          {
+            vertex: vertex,
+            entities: root_entities,
+            original_local_point: vertex.position.clone,
+            original_root_point: transform_root_point_to_solver(vertex.position.clone, root_to_solver_transformation)
+          }
+        end
+
+        return nil if vertex_entries.empty? && child_instances.empty?
+
+        profile_points = vertex_entries.map { |entry| entry[:original_root_point] }
+        child_instances.each do |entry|
+          0.upto(7) do |i|
+            profile_points << transform_root_point_to_solver(
+              transform_point_by_instance_path(entry[:instance].bounds.corner(i), entry[:path] || []),
+              root_to_solver_transformation
+            )
+          end
         end
       end
 
       # A saved Smart Scale Zone replaces the auto-detected profile; only
       # the root entity has one (nested children keep auto-detection).
-      profile = zone_override && smart_scale_zone_profile_with_override(axis_id, profile_points, zone_override)
+      profile = zone_profile || nil
       profile ||= smart_scale_profile_from_part_ranges(
         axis_id,
         profile_points,
@@ -3295,7 +3434,7 @@ module Zbellbound::SmartGizmoPro
       reference_length = profile[:max] - profile[:min]
       return nil unless reference_length > 0
 
-      SmartScaleGestureState.new(
+      state = SmartScaleGestureState.new(
         entity: entity,
         axis_id: axis_id,
         profile: profile,
@@ -3303,8 +3442,49 @@ module Zbellbound::SmartGizmoPro
         vertex_entries: vertex_entries,
         instance_entries: child_instances,
         mask: mask,
-        root_to_solver_transformation: root_to_solver_transformation
+        root_to_solver_transformation: root_to_solver_transformation,
+        zone: zone_profile ? true : false,
+        curve_entries: curve_units
       )
+      state
+    end
+
+    # -- Saved-zone safety guard ---------------------------------------------
+    #
+    # A saved-zone gesture writes real geometry, so it is checked twice. Any
+    # failure rolls the gesture back and aborts it (see SmartScaleApplier.apply!)
+    # rather than leaving corrupted geometry behind.
+
+    ZONE_PERPENDICULAR_TOLERANCE = 1e-3
+    ZONE_FORWARD_TOLERANCE = 1e-6
+
+    # Before a write: the candidate local point, carried forward through the
+    # vertex's own stored transform, must land on the target solver point.
+    # `target_solver` is already a solver-space point (see apply!).
+    def zone_candidate_valid?(entry, target_solver, target_local, state)
+      forward = transform_root_point_to_solver(target_local.transform(entry[:local_to_root]), state.root_to_solver_transformation)
+      scale = [1.0, target_solver.to_a.map(&:abs).max].max
+      forward.distance(target_solver) <= ZONE_FORWARD_TOLERANCE * scale
+    end
+
+    # After the write: every vertex (curve vertices included) must sit within
+    # |stretch delta| of where it started in solver space and must have moved
+    # only along the zone axis.
+    def zone_write_back_valid?(state, ratio)
+      profile = state.profile
+      limit = ((profile[:max] - profile[:min]) * (ratio - 1.0)).abs + ZONE_PERPENDICULAR_TOLERANCE
+      axis = state.axis_id
+      (state.vertex_entries + state.curve_entries.flat_map { |unit| unit[:vertex_entries] }).all? do |entry|
+        next true unless entry[:vertex].valid?
+
+        local_now = entry[:vertex].position
+        root_now = entry[:local_to_root] ? local_now.transform(entry[:local_to_root]) : local_now
+        now = transform_root_point_to_solver(root_now, state.root_to_solver_transformation)
+        orig = entry[:original_root_point]
+        along = point_axis_value(now, axis) - point_axis_value(orig, axis)
+        drift = Math.sqrt([(now.distance(orig)**2) - (along**2), 0.0].max)
+        along.abs <= limit && drift <= ZONE_PERPENDICULAR_TOLERANCE
+      end
     end
 
     def build_smart_scale_gesture_state(data)
@@ -3415,6 +3595,77 @@ module Zbellbound::SmartGizmoPro
 
     def reset_smart_scale_session
       @smart_scale_session = nil
+    end
+
+    # Saved-zone curves. Writing curve vertices individually makes SketchUp
+    # re-fit the curve and its faces after every write (arcs/circles end up
+    # far from where they were meant to go), so a curve is NEVER deformed:
+    # it is classified as one unit from its solver-space range and moved
+    # rigidly with a single transform_entities call.
+    #
+    #   wholly before inner_min .......... unchanged
+    #   wholly after inner_max ........... translated by the stretch delta
+    #   wholly inside the stretch zone ... translated (not stretched) so its
+    #                                      centre lands where the zone maps it
+    #   reaching only the near end ....... unchanged (near)
+    #   reaching only the far end ........ translated by the stretch delta (far)
+    #   reaching both protected ends ..... unchanged
+    #
+    # Curves of one owner that share a vertex are merged into one unit so a
+    # shared vertex is moved exactly once.
+    def zone_curve_units(curves, entries)
+      by_vertex = entries.to_h { |entry| [entry[:vertex], entry] }
+      units = []
+      curves.each do |curve|
+        verts = curve[:edges].flat_map(&:vertices).uniq
+        unit = units.find { |u| u[:entities] == curve[:entities] && verts.any? { |v| u[:vertices].include?(v) } }
+        if unit
+          unit[:edges] |= curve[:edges]
+          unit[:vertices] |= verts
+        else
+          units << { entities: curve[:entities], edges: curve[:edges].dup, vertices: verts, composite: curve[:composite],
+                     applied: nil, applied_shift: 0.0 }
+        end
+      end
+      units.each { |u| u[:vertex_entries] = u[:vertices].filter_map { |v| by_vertex[v] } }
+      units.reject { |u| u[:vertex_entries].empty? }
+    end
+
+    def zone_curve_shift(unit, axis_id, profile, delta, old_inner, new_inner)
+      values = unit[:vertex_entries].map { |e| point_axis_value(e[:original_root_point], axis_id) }
+      lo, hi = values.minmax
+      tol = smart_scale_tolerance
+      reaches_near = lo < profile[:inner_min] - tol
+      reaches_far = hi > profile[:inner_max] + tol
+      return 0.0 if reaches_near && reaches_far
+      return 0.0 if reaches_near
+      return delta if reaches_far
+
+      center = (lo + hi) / 2.0
+      mapped = profile[:inner_min] + (((center - profile[:inner_min]) / old_inner.to_f) * new_inner)
+      mapped - center
+    end
+
+    # Moves one curve unit to this frame's shift: one transform_entities
+    # call for the whole unit, and none at all when the shift is unchanged.
+    def zone_move_curve_unit(unit, state, delta, old_inner, new_inner)
+      return unless unit[:edges].all?(&:valid?)
+
+      shift = zone_curve_shift(unit, state.axis_id, state.profile, delta, old_inner, new_inner)
+      return if (shift - unit[:applied_shift]).abs < 1e-12
+
+      vector = case state.axis_id
+               when :x then Geom::Vector3d.new(shift, 0, 0)
+               when :y then Geom::Vector3d.new(0, shift, 0)
+               when :z then Geom::Vector3d.new(0, 0, shift)
+               end
+      root_tr = transform_solver_transformation_to_root(Geom::Transformation.translation(vector), state.root_to_solver_transformation)
+      composite = unit[:composite]
+      target = composite ? composite.inverse * root_tr * composite : root_tr
+      step = unit[:applied] ? target * unit[:applied].inverse : target
+      unit[:entities].transform_entities(step, unit[:edges])
+      unit[:applied] = target
+      unit[:applied_shift] = shift
     end
 
     # -- Smart Scale Zone editing (Stage 2) ---------------------------------
