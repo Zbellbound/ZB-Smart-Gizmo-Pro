@@ -145,6 +145,25 @@ Smart Scale is a structure-aware alternative to normal SketchUp scale.
 - Plain geometry can fall back to a simpler scale mode when there is no useful structure to preserve.
 - Copied Dynamic Components are handled more safely by uniquing the copied component tree before Smart Scale works on it.
 
+### Smart Scale Zone editing (Stage 2, DEV builds only)
+
+> **Status: development prototype**, present in DEV test builds. Not in the user manual. Editable
+> dimensions (Stage 3) are not started.
+
+Smart Scale enabled in Preferences only makes the feature available; **nothing is drawn on hover or
+during a normal drag.**
+
+- Right-click an X/Y/Z scale handle and choose **Edit Smart Scale Zone**. This enters a mode for
+  only that axis.
+- Two draggable boundaries are shown, `[protected] | [stretch] | [protected]`, with a subtle fill
+  between them. They set the profile's `inner_min` / `inner_max`, stay inside the object's range and
+  cannot cross (minimum stretch zone: 5 mm).
+- **Enter**, or a click away from both boundaries, applies the zone as one Undo step. **Esc**
+  cancels and keeps the previous zone. Opening the menu or merely dragging records no Undo.
+- The zone is saved on the object per axis and per orientation (Global / Object / each custom
+  orientation), as the two protected widths, and the existing Smart Scale solver uses it in place of
+  the auto-detected profile. There is no separate scaling path.
+
 ## Pivot editing
 
 - Drag the center pivot control to reposition the gizmo origin.

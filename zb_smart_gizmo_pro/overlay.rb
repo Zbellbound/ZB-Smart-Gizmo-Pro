@@ -74,12 +74,16 @@ module Zbellbound::SmartGizmoPro
   class SmartScaleGestureState
     attr_reader :entity, :axis_id, :profile, :reference_length, :vertex_entries,
                 :instance_entries, :mask, :ratio, :mode, :original_entity_transformation,
-                :anchor_point, :gizmo_transformation, :root_to_solver_transformation
+                :anchor_point, :gizmo_transformation, :root_to_solver_transformation, :zone, :curve_entries
+    attr_accessor :aborted
 
     def initialize(entity:, axis_id:, profile:, reference_length:, vertex_entries:, instance_entries:, mask:,
                    mode: :frame, original_entity_transformation: nil, anchor_point: nil, gizmo_transformation: nil,
-                   root_to_solver_transformation: IDENTITY)
+                   root_to_solver_transformation: IDENTITY, zone: false, curve_entries: [])
       @entity = entity
+      @zone = zone
+      @curve_entries = curve_entries.freeze
+      @aborted = false
       @axis_id = axis_id
       @profile = profile
       @reference_length = reference_length
@@ -98,6 +102,7 @@ module Zbellbound::SmartGizmoPro
       return false unless @entity&.valid?
 
       vertex_entries.all? { |entry| entry[:vertex].valid? } &&
+        curve_entries.all? { |unit| unit[:edges].all?(&:valid?) } &&
         instance_entries.all? do |entry|
           entry[:instance].valid? &&
             (!entry[:nested_state] || entry[:nested_state].valid?)
@@ -130,6 +135,15 @@ module Zbellbound::SmartGizmoPro
         next if payload[:vertices].empty?
 
         entities.transform_by_vectors(payload[:vertices], payload[:vectors])
+      end
+
+      # Saved-zone curves were moved as rigid units: move each back whole.
+      curve_entries.each do |unit|
+        next unless unit[:applied]
+
+        unit[:entities].transform_entities(unit[:applied].inverse, unit[:edges]) if unit[:edges].all?(&:valid?)
+        unit[:applied] = nil
+        unit[:applied_shift] = 0.0
       end
 
       instance_entries.each do |entry|
@@ -193,7 +207,16 @@ module Zbellbound::SmartGizmoPro
       return false if state.mode == :basic && ratio == 0.0
       return false unless ratio.positive? || state.mode == :basic
 
-      state.restore!
+      # A saved-zone gesture that failed validation stays aborted: nothing
+      # more is written for it (see zone_write_back_valid?).
+      return false if state.aborted
+
+      # Saved-zone gestures never restore-then-rewrite: every target comes
+      # from the immutable original snapshot and each owner is written ONCE
+      # per frame, straight from where its vertices are now. (A restore pass
+      # first would write the same connected vertices twice per frame, and
+      # in a real model every write re-evaluates connected curves and faces.)
+      state.restore! unless state.zone
 
       if state.mode == :basic
         data = [:scale, nil, ratio, state.mask, state.reference_length, state.anchor_point, state.gizmo_transformation]
@@ -214,13 +237,24 @@ module Zbellbound::SmartGizmoPro
       new_inner = old_inner + delta
       return false if new_inner <= 0
 
+      # Saved zone, zero stretch: nothing to compute and nothing to write.
+      # restore! only touches vertices that are not already at their original
+      # position, so a gesture sitting at ratio 1.0 performs no geometry write.
+      if state.zone && delta.abs < 1e-12
+        state.restore!
+        overlay.invalidate_smart_scale_bounds(state)
+        state.ratio = ratio
+        return true
+      end
+
       stretch_factor = new_inner / old_inner.to_f
       entity_vertex_map = Hash.new { |hash, key| hash[key] = { vertices: [], vectors: [] } }
 
       state.vertex_entries.each do |entry|
         next unless entry[:vertex].valid?
 
-        value = overlay.point_axis_value(entry[:original_root_point], state.axis_id)
+        actual = overlay.point_axis_value(entry[:original_root_point], state.axis_id)
+        value = actual
         new_value = if value <= profile[:inner_min]
           value
         elsif value >= profile[:inner_max]
@@ -232,6 +266,16 @@ module Zbellbound::SmartGizmoPro
 
         target_root = overlay.point_with_axis_value(entry[:original_root_point], state.axis_id, new_value)
         target_local = overlay.transform_solver_point_to_root(target_root, state.root_to_solver_transformation)
+        if entry[:local_to_root]
+          target_local = target_local.transform(entry[:local_to_root].inverse)
+          # Saved-zone candidate check BEFORE anything is written: carrying
+          # the candidate local point forward again must land on the target
+          # solver point (catches mirrored / sheared / degenerate transforms).
+          unless overlay.zone_candidate_valid?(entry, target_root, target_local, state)
+            state.aborted = true
+            return false
+          end
+        end
         current_local = entry[:vertex].position
         next if current_local == target_local
 
@@ -243,6 +287,23 @@ module Zbellbound::SmartGizmoPro
         next if payload[:vertices].empty?
 
         entities.transform_by_vectors(payload[:vertices], payload[:vectors])
+      end
+
+      # Saved-zone curves: never deformed, never written vertex by vertex.
+      # Each curve (with every vertex it shares with other edges) is moved as
+      # ONE rigid unit by a single transform_entities call.
+      state.curve_entries.each do |unit|
+        overlay.zone_move_curve_unit(unit, state, delta, old_inner, new_inner)
+      end
+
+      # Saved-zone safety guard: every written vertex must now sit on its
+      # target (moved only along the zone axis, never absurdly far). If the
+      # model did not take the write as computed, put everything back and
+      # abort the zone gesture instead of leaving corrupted geometry.
+      if state.zone && !overlay.zone_write_back_valid?(state, ratio)
+        state.restore!
+        state.aborted = true
+        return false
       end
 
       state.instance_entries.each do |entry|
@@ -460,6 +521,7 @@ module Zbellbound::SmartGizmoPro
         return true
       end
       return if inert?
+      return handle_smart_scale_zone_mouse_move(x, y, view) if smart_scale_zone_edit_active?
       return if @mouse && @mouse == [x, y]
       return if @native_tool_override
       
@@ -502,6 +564,7 @@ module Zbellbound::SmartGizmoPro
     def onLButtonDown(flags, x, y, view)
       return true if point_orientation_active?
       return if inert?
+      return handle_smart_scale_zone_button_down(x, y, view) if smart_scale_zone_edit_active?
       return if @native_tool_override
 
       @flags = flags
@@ -545,6 +608,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def onLButtonUp(flags, x, y, view)
+      return handle_smart_scale_zone_button_up(view) if smart_scale_zone_edit_active?
       if point_orientation_active?
         handle_point_orientation_click(view)
         return true
@@ -619,6 +683,7 @@ module Zbellbound::SmartGizmoPro
     end
 
     def clear_edit_state
+      cancel_smart_scale_zone_edit
       @last_transform = nil
       @last_smart_scale_session = nil
       @edit_mouse = nil
@@ -887,7 +952,8 @@ module Zbellbound::SmartGizmoPro
     end
 
     # @param [Sketchup::View] view
-    def deactivate(_view)
+    def deactivate(view)
+      cancel_smart_scale_zone_edit(view)
       @tool_active = false
       reset
       stop
@@ -1331,6 +1397,13 @@ module Zbellbound::SmartGizmoPro
         end
         if data[0] == :scale && !smart_scale_supported?(data)
           @last_smart_scale_session = nil
+        end
+        # A saved Smart Scale Zone means the selection must NEVER be scaled
+        # uniformly as a whole: if the zone solver could not run this frame,
+        # skip the frame rather than degrade to the ordinary scale below.
+        if data[0] == :scale && smart_scale_supported?(data) && smart_scale_zone_active_for_selection?(data)
+          smart_scale_log('zone gesture could not be applied; ordinary scale suppressed')
+          next
         end
         # When smart scale was attempted but the gesture state couldn't be
         # built (e.g. object has no usable structure), fall through to the
@@ -3182,6 +3255,60 @@ module Zbellbound::SmartGizmoPro
       :unsupported
     end
 
+    # True when any selected entity has a saved zone for this gesture's axis.
+    def smart_scale_zone_active_for_selection?(data)
+      axis_id = smart_scale_axis_id(data[3])
+      return false unless axis_id
+
+      @selection.to_a.any? { |entity| smart_scale_zone_override(entity, axis_id) }
+    end
+
+    # Saved-zone geometry: every raw edge vertex at ANY nesting depth, each
+    # with the transformation that carries its local coordinates up to the
+    # selected entity's space. The one SmartScaleApplier then maps every
+    # vertex through the zone profile in solver space and writes it back in
+    # that vertex's own local coordinates -- no group/component transform is
+    # scaled, so nested assemblies stay coherent.
+    #
+    # A definition reachable through more than one instance (one that could
+    # not be made unique) is collected ONCE, through the first path. Its
+    # vertices are the same objects for every instance; listing them again
+    # with another instance's transform would apply several different
+    # vectors to one vertex and fling the geometry far from where it was.
+    def collect_zone_geometry(entities, root_to_solver_transformation, composite = nil, edges = [], entries = [], depth = 0, seen = [], curves = [])
+      return [edges, entries, curves] unless entities && depth <= 8
+
+      own_edges = entities.grep(Sketchup::Edge)
+      edges.concat(own_edges)
+      own_edges.select(&:curve).group_by(&:curve).each_value do |curve_edges|
+        curves << { entities: entities, edges: curve_edges, composite: composite }
+      end
+      own_edges.flat_map(&:vertices).uniq.each do |vertex|
+        local = vertex.position.clone
+        root_point = composite ? local.transform(composite) : local
+        entry = {
+          vertex: vertex,
+          entities: entities,
+          original_local_point: local,
+          original_root_point: transform_root_point_to_solver(root_point, root_to_solver_transformation)
+        }
+        entry[:local_to_root] = composite if composite
+        entries << entry
+      end
+
+      child_instances_for_entities(entities).each do |instance|
+        identity = instance.respond_to?(:definition) ? instance.definition : smart_scale_entities(instance)
+        if seen.any? { |other| other == identity }
+          next
+        end
+
+        seen << identity
+        child_tr = composite ? composite * instance.transformation : instance.transformation
+        collect_zone_geometry(smart_scale_entities(instance), root_to_solver_transformation, child_tr, edges, entries, depth + 1, seen, curves)
+      end
+      [edges, entries, curves]
+    end
+
     def build_smart_scale_gesture_state_for_entity(entity, axis_id, mask, data = nil, depth = 0, parent_root_to_solver = nil)
       root_entities = smart_scale_entities(entity)
       return nil unless root_entities
@@ -3193,32 +3320,57 @@ module Zbellbound::SmartGizmoPro
       # different offsets — that would break the curve definition while
       # leaving the vertex positions stale. Only straight edges contribute
       # to the smart scale gesture.
-      edges = root_entities.grep(Sketchup::Edge).reject(&:curve)
-
-      child_instances = collect_nested_smart_scale_instances(root_entities, axis_id, [], root_to_solver_transformation)
-
-      vertex_entries = edges.flat_map(&:vertices).uniq.map do |vertex|
-        {
-          vertex: vertex,
-          entities: root_entities,
-          original_local_point: vertex.position.clone,
-          original_root_point: transform_root_point_to_solver(vertex.position.clone, root_to_solver_transformation)
-        }
+      # A saved Smart Scale Zone moves ALL geometry (curved edges included),
+      # so everything beyond the stretch zone travels with the scaling; only
+      # auto-detection ignores curve vertices.
+      zone_override = parent_root_to_solver ? nil : smart_scale_zone_override(entity, axis_id)
+      zone_profile = nil
+      if zone_override
+        zone_edges, zone_entries, zone_curves = collect_zone_geometry(root_entities, root_to_solver_transformation)
+        zone_points = zone_entries.map { |entry| entry[:original_root_point] }
+        zone_profile = !zone_points.empty? && smart_scale_zone_profile_with_override(axis_id, zone_points, zone_override)
       end
 
-      return nil if vertex_entries.empty? && child_instances.empty?
+      curve_units = []
+      if zone_profile
+        edges = zone_edges
+        # The curve wins: every vertex of a Curve/ArcCurve (shared ones too)
+        # leaves the stretch batch and travels with its curve as a rigid unit.
+        curve_units = zone_curve_units(zone_curves, zone_entries)
+        curve_vertices = curve_units.flat_map { |unit| unit[:vertex_entries].map { |e| e[:vertex] } }.to_h { |v| [v, true] }
+        vertex_entries = zone_entries.reject { |entry| curve_vertices[entry[:vertex]] }
+        child_instances = []
+        profile_points = zone_points
+      else
+        edges = root_entities.grep(Sketchup::Edge).reject(&:curve)
+        child_instances = collect_nested_smart_scale_instances(root_entities, axis_id, [], root_to_solver_transformation)
 
-      profile_points = vertex_entries.map { |entry| entry[:original_root_point] }
-      child_instances.each do |entry|
-        0.upto(7) do |i|
-          profile_points << transform_root_point_to_solver(
-            transform_point_by_instance_path(entry[:instance].bounds.corner(i), entry[:path] || []),
-            root_to_solver_transformation
-          )
+        vertex_entries = edges.flat_map(&:vertices).uniq.map do |vertex|
+          {
+            vertex: vertex,
+            entities: root_entities,
+            original_local_point: vertex.position.clone,
+            original_root_point: transform_root_point_to_solver(vertex.position.clone, root_to_solver_transformation)
+          }
+        end
+
+        return nil if vertex_entries.empty? && child_instances.empty?
+
+        profile_points = vertex_entries.map { |entry| entry[:original_root_point] }
+        child_instances.each do |entry|
+          0.upto(7) do |i|
+            profile_points << transform_root_point_to_solver(
+              transform_point_by_instance_path(entry[:instance].bounds.corner(i), entry[:path] || []),
+              root_to_solver_transformation
+            )
+          end
         end
       end
 
-      profile = smart_scale_profile_from_part_ranges(
+      # A saved Smart Scale Zone replaces the auto-detected profile; only
+      # the root entity has one (nested children keep auto-detection).
+      profile = zone_profile || nil
+      profile ||= smart_scale_profile_from_part_ranges(
         axis_id,
         profile_points,
         child_instances.map { |entry| [entry[:min], entry[:max]] }
@@ -3282,7 +3434,7 @@ module Zbellbound::SmartGizmoPro
       reference_length = profile[:max] - profile[:min]
       return nil unless reference_length > 0
 
-      SmartScaleGestureState.new(
+      state = SmartScaleGestureState.new(
         entity: entity,
         axis_id: axis_id,
         profile: profile,
@@ -3290,8 +3442,49 @@ module Zbellbound::SmartGizmoPro
         vertex_entries: vertex_entries,
         instance_entries: child_instances,
         mask: mask,
-        root_to_solver_transformation: root_to_solver_transformation
+        root_to_solver_transformation: root_to_solver_transformation,
+        zone: zone_profile ? true : false,
+        curve_entries: curve_units
       )
+      state
+    end
+
+    # -- Saved-zone safety guard ---------------------------------------------
+    #
+    # A saved-zone gesture writes real geometry, so it is checked twice. Any
+    # failure rolls the gesture back and aborts it (see SmartScaleApplier.apply!)
+    # rather than leaving corrupted geometry behind.
+
+    ZONE_PERPENDICULAR_TOLERANCE = 1e-3
+    ZONE_FORWARD_TOLERANCE = 1e-6
+
+    # Before a write: the candidate local point, carried forward through the
+    # vertex's own stored transform, must land on the target solver point.
+    # `target_solver` is already a solver-space point (see apply!).
+    def zone_candidate_valid?(entry, target_solver, target_local, state)
+      forward = transform_root_point_to_solver(target_local.transform(entry[:local_to_root]), state.root_to_solver_transformation)
+      scale = [1.0, target_solver.to_a.map(&:abs).max].max
+      forward.distance(target_solver) <= ZONE_FORWARD_TOLERANCE * scale
+    end
+
+    # After the write: every vertex (curve vertices included) must sit within
+    # |stretch delta| of where it started in solver space and must have moved
+    # only along the zone axis.
+    def zone_write_back_valid?(state, ratio)
+      profile = state.profile
+      limit = ((profile[:max] - profile[:min]) * (ratio - 1.0)).abs + ZONE_PERPENDICULAR_TOLERANCE
+      axis = state.axis_id
+      (state.vertex_entries + state.curve_entries.flat_map { |unit| unit[:vertex_entries] }).all? do |entry|
+        next true unless entry[:vertex].valid?
+
+        local_now = entry[:vertex].position
+        root_now = entry[:local_to_root] ? local_now.transform(entry[:local_to_root]) : local_now
+        now = transform_root_point_to_solver(root_now, state.root_to_solver_transformation)
+        orig = entry[:original_root_point]
+        along = point_axis_value(now, axis) - point_axis_value(orig, axis)
+        drift = Math.sqrt([(now.distance(orig)**2) - (along**2), 0.0].max)
+        along.abs <= limit && drift <= ZONE_PERPENDICULAR_TOLERANCE
+      end
     end
 
     def build_smart_scale_gesture_state(data)
@@ -3404,10 +3597,506 @@ module Zbellbound::SmartGizmoPro
       @smart_scale_session = nil
     end
 
+    # Saved-zone curves. Writing curve vertices individually makes SketchUp
+    # re-fit the curve and its faces after every write (arcs/circles end up
+    # far from where they were meant to go), so a curve is NEVER deformed:
+    # it is classified as one unit from its solver-space range and moved
+    # rigidly with a single transform_entities call.
+    #
+    #   wholly before inner_min .......... unchanged
+    #   wholly after inner_max ........... translated by the stretch delta
+    #   wholly inside the stretch zone ... translated (not stretched) so its
+    #                                      centre lands where the zone maps it
+    #   reaching only the near end ....... unchanged (near)
+    #   reaching only the far end ........ translated by the stretch delta (far)
+    #   reaching both protected ends ..... unchanged
+    #
+    # Curves of one owner that share a vertex are merged into one unit so a
+    # shared vertex is moved exactly once.
+    def zone_curve_units(curves, entries)
+      by_vertex = entries.to_h { |entry| [entry[:vertex], entry] }
+      units = []
+      curves.each do |curve|
+        verts = curve[:edges].flat_map(&:vertices).uniq
+        unit = units.find { |u| u[:entities] == curve[:entities] && verts.any? { |v| u[:vertices].include?(v) } }
+        if unit
+          unit[:edges] |= curve[:edges]
+          unit[:vertices] |= verts
+        else
+          units << { entities: curve[:entities], edges: curve[:edges].dup, vertices: verts, composite: curve[:composite],
+                     applied: nil, applied_shift: 0.0 }
+        end
+      end
+      units.each { |u| u[:vertex_entries] = u[:vertices].filter_map { |v| by_vertex[v] } }
+      units.reject { |u| u[:vertex_entries].empty? }
+    end
+
+    def zone_curve_shift(unit, axis_id, profile, delta, old_inner, new_inner)
+      values = unit[:vertex_entries].map { |e| point_axis_value(e[:original_root_point], axis_id) }
+      lo, hi = values.minmax
+      tol = smart_scale_tolerance
+      reaches_near = lo < profile[:inner_min] - tol
+      reaches_far = hi > profile[:inner_max] + tol
+      return 0.0 if reaches_near && reaches_far
+      return 0.0 if reaches_near
+      return delta if reaches_far
+
+      center = (lo + hi) / 2.0
+      mapped = profile[:inner_min] + (((center - profile[:inner_min]) / old_inner.to_f) * new_inner)
+      mapped - center
+    end
+
+    # Moves one curve unit to this frame's shift: one transform_entities
+    # call for the whole unit, and none at all when the shift is unchanged.
+    def zone_move_curve_unit(unit, state, delta, old_inner, new_inner)
+      return unless unit[:edges].all?(&:valid?)
+
+      shift = zone_curve_shift(unit, state.axis_id, state.profile, delta, old_inner, new_inner)
+      return if (shift - unit[:applied_shift]).abs < 1e-12
+
+      vector = case state.axis_id
+               when :x then Geom::Vector3d.new(shift, 0, 0)
+               when :y then Geom::Vector3d.new(0, shift, 0)
+               when :z then Geom::Vector3d.new(0, 0, shift)
+               end
+      root_tr = transform_solver_transformation_to_root(Geom::Transformation.translation(vector), state.root_to_solver_transformation)
+      composite = unit[:composite]
+      target = composite ? composite.inverse * root_tr * composite : root_tr
+      step = unit[:applied] ? target * unit[:applied].inverse : target
+      unit[:entities].transform_entities(step, unit[:edges])
+      unit[:applied] = target
+      unit[:applied_shift] = shift
+    end
+
+    # -- Smart Scale Zone editing (Stage 2) ---------------------------------
+    #
+    # Smart Scale being enabled in Preferences only makes the feature
+    # available: nothing is drawn on hover or during a normal drag. The
+    # user right-clicks an X/Y/Z scale handle and chooses "Edit Smart Scale
+    # Zone", which enters a mode for ONLY that axis showing two draggable
+    # boundaries -- [protected] | [stretch] | [protected] -- that set the
+    # profile's inner_min/inner_max. Dragging only moves the in-memory
+    # session; Enter (or a click away from both boundaries) commits it as a
+    # single Undo step, Esc discards it and leaves the previous zone alone.
+    #
+    # The committed zone is stored on the entity as the two protected
+    # widths (inner_min - min, max - inner_max) per axis and orientation,
+    # which stay valid after a Smart Scale because the protected ends keep
+    # their size. build_smart_scale_gesture_state_for_entity then uses it
+    # instead of the auto-detected profile, so the one existing solver
+    # (SmartScaleApplier) consumes it -- there is no second scaling path.
+
+    SMART_SCALE_ZONE_AXIS_RGB = { x: [255, 0, 0], y: [0, 128, 0], z: [0, 0, 255] }.freeze
+    SMART_SCALE_ZONE_FILL_ALPHA = 70
+    SMART_SCALE_ZONE_PROTECTED_COLOR = Sketchup::Color.new(128, 128, 128, 60).freeze
+    SMART_SCALE_ZONE_DICTIONARY = 'zb_smart_gizmo_pro_smart_scale_zones'.freeze
+    # Smallest stretch zone the editor allows; same floor SmartScaleApplier
+    # already enforces on the stretch zone while scaling.
+    SMART_SCALE_ZONE_MIN_GAP = SmartScaleApplier::MIN_INNER_OPENING
+    # Generous on purpose: the drawn boundary stays slim, the grab area does not.
+    SMART_SCALE_ZONE_PICK_RADIUS = 30
+    SMART_SCALE_ZONE_RETURN_KEY = 13
+
+    # -- Persistence -----------------------------------------------------
+
+    # Zones are measured in the solver's frame, so Global, Object and each
+    # custom orientation keep their own zone for an axis.
+    def smart_scale_zone_orientation_key(entity)
+      return 'global' if smart_scale_global_orientation?
+
+      axes = CustomOrientation.local_axes_for(entity)
+      return 'object' unless axes
+
+      'custom:' + axes.flat_map { |v| [v.x, v.y, v.z] }.map { |n| format('%.3f', n) }.join(',')
+    end
+
+    def smart_scale_zone_attribute_key(entity, axis_id)
+      "#{axis_id}:#{smart_scale_zone_orientation_key(entity)}"
+    end
+
+    # [protected width at the min end, protected width at the max end] or nil.
+    def smart_scale_zone_override(entity, axis_id)
+      return nil unless entity.respond_to?(:get_attribute)
+
+      value = entity.get_attribute(SMART_SCALE_ZONE_DICTIONARY, smart_scale_zone_attribute_key(entity, axis_id))
+      return nil unless value.is_a?(Array) && value.length == 2
+      return nil unless value.all? { |n| n.is_a?(Numeric) && n.to_f.finite? && n >= 0 }
+
+      value.map(&:to_f)
+    end
+
+    # The solver profile for a saved zone, or nil when it no longer fits the
+    # geometry (then the auto-detected profile is used instead).
+    def smart_scale_zone_profile_with_override(axis_id, points, override)
+      outer_min, outer_max = points.map { |point| point_axis_value(point, axis_id) }.minmax
+      return nil unless outer_min && outer_max
+
+      inner_min = outer_min + override[0]
+      inner_max = outer_max - override[1]
+      return nil if inner_max - inner_min < SMART_SCALE_ZONE_MIN_GAP - 1e-9
+
+      { min: outer_min, inner_min: inner_min, inner_max: inner_max, max: outer_max }
+    end
+
+    # -- Session ---------------------------------------------------------
+
+    def smart_scale_zone_edit_active?
+      !@smart_scale_zone_edit.nil?
+    end
+
+    def smart_scale_zone_edit_session
+      @smart_scale_zone_edit
+    end
+
+    # Axis whose scale handle is under the cursor and may open the editor.
+    def smart_scale_zone_menu_axis
+      return nil unless smart_scale_enabled? && selected_one_object?
+
+      hovered_smart_scale_axis_id
+    end
+
+    # Which axis's scale handle the mouse is CURRENTLY hovering, from the
+    # real per-axis handle state the existing onMouseMove chain maintains.
+    def hovered_smart_scale_axis_id
+      return nil unless @gizmo.respond_to?(:axes)
+
+      axis = @gizmo.axes.find { |a| a.respond_to?(:scale_gizmo) && a.scale_gizmo&.mouse_active? }
+      axis&.id
+    end
+
+    def start_smart_scale_zone_edit(axis_id)
+      return false unless [:x, :y, :z].include?(axis_id)
+      return false unless smart_scale_enabled? && selected_one_object?
+
+      entity = @selection[0]
+      return false unless entity&.valid?
+
+      rts = smart_scale_root_to_solver_transformation(entity)
+      cross_min, cross_max = smart_scale_zone_cross_bounds(entity, rts)
+      return false unless cross_min && cross_max
+
+      mask = [axis_id == :x, axis_id == :y, axis_id == :z]
+      state = build_smart_scale_gesture_state_for_entity(entity, axis_id, mask, [:scale, nil, 1.0, mask, nil, nil, nil])
+      if state&.profile
+        profile = state.profile
+        outer_min = profile[:min]
+        outer_max = profile[:max]
+        inner_min = profile[:inner_min]
+        inner_max = profile[:inner_max]
+      else
+        outer_min = point_axis_value(cross_min, axis_id)
+        outer_max = point_axis_value(cross_max, axis_id)
+        inner_min = outer_min + (outer_max - outer_min) * 0.2
+        inner_max = outer_max - (outer_max - outer_min) * 0.2
+      end
+      return false unless outer_max - outer_min >= SMART_SCALE_ZONE_MIN_GAP
+
+      if inner_max - inner_min < SMART_SCALE_ZONE_MIN_GAP
+        mid = (inner_min + inner_max) / 2.0
+        inner_max = [mid + SMART_SCALE_ZONE_MIN_GAP / 2.0, outer_max].min
+        inner_min = [inner_max - SMART_SCALE_ZONE_MIN_GAP, outer_min].max
+        inner_max = inner_min + SMART_SCALE_ZONE_MIN_GAP
+      end
+
+      @smart_scale_zone_edit = {
+        entity: entity, axis_id: axis_id, attribute_key: smart_scale_zone_attribute_key(entity, axis_id),
+        rts: rts, cross_min: cross_min, cross_max: cross_max,
+        outer_min: outer_min, outer_max: outer_max, inner_min: inner_min, inner_max: inner_max,
+        initial: [inner_min, inner_max], drag: nil, grab_offset: 0.0, hover: nil
+      }
+      @model.tools.push_tool(self) unless active_itself?
+      Sketchup.set_status_text('Smart Scale Zone: drag the two boundaries. Enter or click elsewhere to apply, Esc to cancel.')
+      @model.active_view&.invalidate
+      true
+    rescue StandardError => e
+      @smart_scale_zone_edit = nil
+      warn_overlay_issue('start smart scale zone edit', e)
+      false
+    end
+
+    # Moves one boundary (:inner_min / :inner_max) to value, clamped inside
+    # the range so the two can never cross. Returns the clamped value.
+    def set_smart_scale_zone_boundary(which, value)
+      session = @smart_scale_zone_edit
+      return nil unless session && value
+
+      clamped = if which == :inner_min
+                  value.clamp(session[:outer_min], session[:inner_max] - SMART_SCALE_ZONE_MIN_GAP)
+                else
+                  value.clamp(session[:inner_min] + SMART_SCALE_ZONE_MIN_GAP, session[:outer_max])
+                end
+      session[which] = clamped
+    end
+
+    # Applies the zone as ONE Undo step (none when nothing changed).
+    def commit_smart_scale_zone_edit(view = nil)
+      session = @smart_scale_zone_edit
+      return false unless session
+
+      @smart_scale_zone_edit = nil
+      entity = session[:entity]
+      changed = (session[:inner_min] - session[:initial][0]).abs > 1e-9 ||
+                (session[:inner_max] - session[:initial][1]).abs > 1e-9
+      if changed && entity&.valid?
+        return finish_smart_scale_zone_edit(view) && false unless start_licensed_operation('Edit Smart Scale Zone')
+
+        entity.set_attribute(
+          SMART_SCALE_ZONE_DICTIONARY, session[:attribute_key],
+          [session[:inner_min] - session[:outer_min], session[:outer_max] - session[:inner_max]]
+        )
+        @model.commit_operation
+        reset_smart_scale_session
+        reset_smart_scale_gesture
+      end
+      finish_smart_scale_zone_edit(view)
+      changed
+    rescue StandardError => e
+      @model.abort_operation
+      warn_overlay_issue('commit smart scale zone edit', e)
+      finish_smart_scale_zone_edit(view)
+      false
+    end
+
+    # Leaves the mode with nothing written, so the previous zone stands.
+    def cancel_smart_scale_zone_edit(view = nil)
+      return false unless @smart_scale_zone_edit
+
+      @smart_scale_zone_edit = nil
+      finish_smart_scale_zone_edit(view)
+      true
+    end
+
+    def finish_smart_scale_zone_edit(view)
+      @model.tools.pop_tool if active_itself?
+      Sketchup.set_status_text('')
+      (view || @model&.active_view)&.invalidate
+    end
+
+    # -- Mouse -----------------------------------------------------------
+
+    def handle_smart_scale_zone_mouse_move(x, y, view)
+      session = @smart_scale_zone_edit
+      @mouse = [x, y]
+      if session[:drag]
+        value = smart_scale_zone_value_at(x, y, view)
+        set_smart_scale_zone_boundary(session[:drag], value - session[:grab_offset]) if value
+        view.invalidate
+      else
+        hover = smart_scale_zone_boundary_at(x, y, view)
+        if hover != session[:hover]
+          session[:hover] = hover
+          view.invalidate
+        end
+      end
+      true
+    end
+
+    def handle_smart_scale_zone_button_down(x, y, view)
+      session = @smart_scale_zone_edit
+      which = smart_scale_zone_boundary_at(x, y, view)
+      unless which
+        commit_smart_scale_zone_edit(view)
+        return true
+      end
+
+      value = smart_scale_zone_value_at(x, y, view)
+      session[:drag] = which
+      session[:grab_offset] = value ? value - session[which] : 0.0
+      view.invalidate
+      true
+    end
+
+    def handle_smart_scale_zone_button_up(view)
+      @smart_scale_zone_edit[:drag] = nil
+      view.invalidate
+      true
+    end
+
+    def smart_scale_zone_combined_transformation(session)
+      session[:entity].transformation * session[:rts].inverse
+    end
+
+    # The boundary whose outline is within pick radius of the cursor.
+    def smart_scale_zone_boundary_at(x, y, view)
+      session = @smart_scale_zone_edit
+      tr = smart_scale_zone_combined_transformation(session)
+      best = nil
+      best_distance = SMART_SCALE_ZONE_PICK_RADIUS
+      [:inner_min, :inner_max].each do |which|
+        corners = smart_scale_zone_face_points(session[:axis_id], session[which], session[:cross_min], session[:cross_max])
+        screen = corners.map { |pt| view.screen_coords(pt.transform(tr)) }
+        distance = screen.each_with_index.map { |pt, i| smart_scale_zone_segment_distance(x, y, pt, screen[(i + 1) % 4]) }.min
+        if distance <= best_distance
+          best = which
+          best_distance = distance
+        end
+      end
+      best
+    end
+
+    def smart_scale_zone_segment_distance(x, y, a, b)
+      dx = b.x - a.x
+      dy = b.y - a.y
+      length_sq = dx * dx + dy * dy
+      t = length_sq.zero? ? 0.0 : (((x - a.x) * dx + (y - a.y) * dy) / length_sq).clamp(0.0, 1.0)
+      Math.hypot(x - (a.x + t * dx), y - (a.y + t * dy))
+    end
+
+    # Axis value (solver units) under the cursor: the point on the axis
+    # line closest to the cursor's pick ray.
+    def smart_scale_zone_value_at(x, y, view)
+      session = @smart_scale_zone_edit
+      tr = smart_scale_zone_combined_transformation(session)
+      axis_id = session[:axis_id]
+      cross_min = session[:cross_min]
+      cross_max = session[:cross_max]
+      center = Geom::Point3d.new((cross_min.x + cross_max.x) / 2.0, (cross_min.y + cross_max.y) / 2.0,
+                                 (cross_min.z + cross_max.z) / 2.0)
+      base = session[:outer_min]
+      p0 = point_with_axis_value(center, axis_id, base).transform(tr).to_a
+      p1 = point_with_axis_value(center, axis_id, base + 1.0).transform(tr).to_a
+      origin, direction = view.pickray(x, y)
+      q0 = origin.to_a
+      v = direction.to_a
+      u = p1.zip(p0).map { |a, b| a - b }
+      w = p0.zip(q0).map { |a, b| a - b }
+      dot = ->(a, b) { a.zip(b).sum { |m, n| m * n } }
+      a = dot.call(u, u)
+      b = dot.call(u, v)
+      c = dot.call(v, v)
+      denominator = a * c - b * b
+      return nil if denominator.abs < 1e-12
+
+      base + (b * dot.call(v, w) - c * dot.call(u, w)) / denominator
+    end
+
+    # -- Drawing ---------------------------------------------------------
+
+    def draw_smart_scale_zone_edit(view)
+      session = @smart_scale_zone_edit
+      return unless session
+      return unless session[:entity]&.valid?
+
+      tr = smart_scale_zone_combined_transformation(session)
+      axis_id = session[:axis_id]
+      cross_min = session[:cross_min]
+      cross_max = session[:cross_max]
+      axis_color = smart_scale_zone_axis_color(axis_id)
+
+      left = smart_scale_zone_slab_bounds(axis_id, session[:outer_min], session[:inner_min], cross_min, cross_max)
+      middle = smart_scale_zone_slab_bounds(axis_id, session[:inner_min], session[:inner_max], cross_min, cross_max)
+      right = smart_scale_zone_slab_bounds(axis_id, session[:inner_max], session[:outer_max], cross_min, cross_max)
+      draw_smart_scale_zone_fill(view, left, tr, SMART_SCALE_ZONE_PROTECTED_COLOR)
+      draw_smart_scale_zone_fill(view, right, tr, SMART_SCALE_ZONE_PROTECTED_COLOR)
+      draw_smart_scale_zone_fill(view, middle, tr, smart_scale_zone_axis_color(axis_id, SMART_SCALE_ZONE_FILL_ALPHA))
+
+      [:inner_min, :inner_max].each do |which|
+        highlighted = session[:drag] == which || (session[:drag].nil? && session[:hover] == which)
+        draw_smart_scale_zone_boundary(view, axis_id, session[which], cross_min, cross_max, tr, axis_color, highlighted ? 7 : 4)
+      end
+    rescue StandardError => e
+      warn_overlay_issue('draw smart scale zone edit', e)
+      nil
+    end
+
+    def smart_scale_zone_axis_color(axis_id, alpha = 255)
+      rgb = SMART_SCALE_ZONE_AXIS_RGB[axis_id]
+      return nil unless rgb
+
+      Sketchup::Color.new(rgb[0], rgb[1], rgb[2], alpha)
+    end
+
+    # The overall LOCAL bounds of the entity as [min_point, max_point] in
+    # SOLVER space (the space the profile values live in): the zone slabs'
+    # cross-section. Reuses entity.definition.bounds exactly as the gizmo's
+    # own bounds do -- never a fresh geometry scan.
+    def smart_scale_zone_cross_bounds(entity, root_to_solver_transformation)
+      return nil unless entity.respond_to?(:definition)
+
+      bb = entity.definition.bounds
+      return nil unless bb && !bb.empty?
+
+      points = 0.upto(7).map { |i| transform_root_point_to_solver(bb.corner(i), root_to_solver_transformation) }
+      xs = points.map(&:x)
+      ys = points.map(&:y)
+      zs = points.map(&:z)
+      [Geom::Point3d.new(xs.min, ys.min, zs.min), Geom::Point3d.new(xs.max, ys.max, zs.max)]
+    rescue StandardError => e
+      warn_overlay_issue('compute smart scale zone cross bounds', e)
+      nil
+    end
+
+    # One axis-aligned slab, in SOLVER space, spanning axis_min..axis_max
+    # along axis_id and the full cross_min..cross_max extent on the other
+    # two axes.
+    def smart_scale_zone_slab_bounds(axis_id, axis_min, axis_max, cross_min, cross_max)
+      lo, hi = case axis_id
+               when :x
+                 [Geom::Point3d.new(axis_min, cross_min.y, cross_min.z), Geom::Point3d.new(axis_max, cross_max.y, cross_max.z)]
+               when :y
+                 [Geom::Point3d.new(cross_min.x, axis_min, cross_min.z), Geom::Point3d.new(cross_max.x, axis_max, cross_max.z)]
+               when :z
+                 [Geom::Point3d.new(cross_min.x, cross_min.y, axis_min), Geom::Point3d.new(cross_max.x, cross_max.y, axis_max)]
+               end
+      bb = Geom::BoundingBox.new
+      bb.add(lo)
+      bb.add(hi)
+      bb
+    end
+
+    # The 4 corner points (SOLVER space) of the cross-section face at
+    # axis_id == axis_value -- a boundary's outline.
+    def smart_scale_zone_face_points(axis_id, axis_value, cross_min, cross_max)
+      case axis_id
+      when :x
+        [Geom::Point3d.new(axis_value, cross_min.y, cross_min.z), Geom::Point3d.new(axis_value, cross_max.y, cross_min.z),
+         Geom::Point3d.new(axis_value, cross_max.y, cross_max.z), Geom::Point3d.new(axis_value, cross_min.y, cross_max.z)]
+      when :y
+        [Geom::Point3d.new(cross_min.x, axis_value, cross_min.z), Geom::Point3d.new(cross_max.x, axis_value, cross_min.z),
+         Geom::Point3d.new(cross_max.x, axis_value, cross_max.z), Geom::Point3d.new(cross_min.x, axis_value, cross_max.z)]
+      when :z
+        [Geom::Point3d.new(cross_min.x, cross_min.y, axis_value), Geom::Point3d.new(cross_max.x, cross_min.y, axis_value),
+         Geom::Point3d.new(cross_max.x, cross_max.y, axis_value), Geom::Point3d.new(cross_min.x, cross_max.y, axis_value)]
+      end
+    end
+
+    def draw_smart_scale_zone_fill(view, bb, tr, color)
+      return unless bb && !bb.empty?
+
+      pts = 0.upto(7).map { |i| bb.corner(i).transform(tr) }
+      top = [pts[0], pts[2], pts[3], pts[1]]
+      bottom = [pts[4], pts[6], pts[7], pts[5]]
+      faces = [
+        top, bottom,
+        [top[0], top[1], bottom[1], bottom[0]],
+        [top[1], top[2], bottom[2], bottom[1]],
+        [top[2], top[3], bottom[3], bottom[2]],
+        [top[3], top[0], bottom[0], bottom[3]]
+      ]
+
+      view.drawing_color = color
+      faces.each { |face| view.draw(GL_QUADS, face) }
+    end
+
+    def draw_smart_scale_zone_boundary(view, axis_id, axis_value, cross_min, cross_max, tr, axis_color, width)
+      return unless axis_color
+
+      pts = smart_scale_zone_face_points(axis_id, axis_value, cross_min, cross_max).map { |pt| pt.transform(tr) }
+      view.line_width = width
+      view.line_stipple = ''
+      view.drawing_color = axis_color
+      view.draw(GL_LINES, (pts + [pts[0]]).each_cons(2).to_a.flatten)
+    end
+
     def stop
     end
 
     def onCancel(reason, view)
+      if smart_scale_zone_edit_active?
+        cancel_smart_scale_zone_edit(view)
+        return
+      end
+
       if reason == 0 && @gizmo.active?
         selected = @selection.to_a
         @gizmo.cancel
@@ -3430,7 +4119,22 @@ module Zbellbound::SmartGizmoPro
       # in-progress gizmo gesture.
       cancel_point_orientation_picker if point_orientation_active?
       return false if inert?
+
+      if smart_scale_zone_edit_active?
+        menu.add_item('Apply Smart Scale Zone') { commit_smart_scale_zone_edit(view) }
+        menu.add_item('Cancel Zone Edit') { cancel_smart_scale_zone_edit(view) }
+        return true
+      end
+
       return false unless gizmo_hovering?(x, y, view)
+
+      zone_axis = smart_scale_zone_menu_axis
+      if zone_axis
+        menu.add_item('Edit Smart Scale Zone') do
+          start_smart_scale_zone_edit(zone_axis) if license_permits_interaction?
+        end
+        menu.add_separator
+      end
 
       ['Global', 'Object'].each_with_index do |name, i|
         cmd = menu.add_item(name) do
@@ -3744,6 +4448,14 @@ module Zbellbound::SmartGizmoPro
       end
       return if inert?
 
+      if smart_scale_zone_edit_active?
+        case key
+        when ESCAPE_KEY then cancel_smart_scale_zone_edit(view)
+        when SMART_SCALE_ZONE_RETURN_KEY then commit_smart_scale_zone_edit(view)
+        end
+        return true
+      end
+
       if key == MOVE_TOOL_KEY
         activate_native_move_tool(view)
         return
@@ -3788,6 +4500,10 @@ module Zbellbound::SmartGizmoPro
       return if @native_tool_override
       return unless active_gizmo? && @gizmo
       sync_gizmo_refresh
+
+      # Zone boundaries are drawn only while editing a zone (never on
+      # hover); first, so the gizmo's own handles stay on top.
+      draw_smart_scale_zone_edit(view)
 
       @gizmo.draw(view) if @gizmo && @selection.length > 0
 
