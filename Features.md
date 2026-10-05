@@ -145,50 +145,24 @@ Smart Scale is a structure-aware alternative to normal SketchUp scale.
 - Plain geometry can fall back to a simpler scale mode when there is no useful structure to preserve.
 - Copied Dynamic Components are handled more safely by uniquing the copied component tree before Smart Scale works on it.
 
-### Smart Scale Zones -- visual prototype (Stage 1, NOT a finished feature)
+### Smart Scale Zone editing (Stage 2, DEV builds only)
 
-> **Status: development prototype.** Visualization only, present in DEV test builds. Not
-> documented in the user manual and not yet a production feature. Stage 2 (clickable zone planes)
-> and Stage 3 (editable dimensions) are deliberately not started.
+> **Status: development prototype**, present in DEV test builds. Not in the user manual. Editable
+> dimensions (Stage 3) are not started.
 
-What it shows, while Smart Scale is enabled and exactly one group/component is selected:
+Smart Scale enabled in Preferences only makes the feature available; **nothing is drawn on hover or
+during a normal drag.**
 
-- **Hovering a scale handle** (before any drag): the axis colour (X red, Y green, Z blue), the
-  protected end regions (muted grey), the stretch region (translucent axis colour), a stronger
-  line on the anchored end, the object outline, and the current dimension.
-- **During the drag**: the same, updated every frame; the right-hand protected end and the stretch
-  region move with the solver's own result, and the dimension is the live target size.
-- **On commit, Esc, selection change, native tool, or any invalid state**: removed immediately. No
-  Tool is pushed, nothing is added to the model, no attributes are written, no Undo entry is made.
-
-Where every value comes from (nothing is recalculated independently):
-
-| Shown | Source |
-| --- | --- |
-| Active axis | `Axis#scale_gizmo` hover/drag flags (`mouse_active?` / `active?`), already maintained by `onMouseMove` |
-| Protected / stretch boundaries | `SmartScaleGestureState#profile` (`min`, `inner_min`, `inner_max`, `max`), built by the existing `build_smart_scale_gesture_state_for_entity` |
-| Space of those boundaries | `SmartScaleGestureState#root_to_solver_transformation` + the entity's `transformation` (Global, Object and custom orientation all respected) |
-| Anchored end | The minimum end: `scale_anchor_point` (`:basic`) and `SmartScaleApplier#apply!` (`:frame`) both keep the minimum end fixed, because handles only drag in the positive direction |
-| Live zone positions | `SmartScaleGestureState#ratio` (set only by `apply!`); a test compares them with the geometry the solver really produced |
-| Outline of current/proposed bounds | `entity.definition.bounds` + `entity.transformation` (the live geometry during a drag), drawn with the existing `draw_bounds` |
-| Dimension | `format_scale_display(state.ratio, state.reference_length)`, the same formatter as the Scale popup and Measurements box |
-| During a drag | the real `@smart_scale_gesture` itself (never rebuilt) |
-
-Performance: while only hovering, the preview state is built once per `[entity, axis]` and cached
-(cleared by `reset_smart_scale_gesture`), so redraws do not rescan geometry. The hover build is
-read-only on purpose: it does not call `smart_scale_entity`, whose `make_unique` would otherwise
-create an Undo entry just from hovering a shared component.
-
-Known limitations of the prototype:
-
-- Single selection only; multi-selection shows nothing.
-- `:basic` mode (plain geometry with no usable structure) shows only the axis colour, anchored end,
-  outline and dimension -- there is no protected region to draw, and none is invented.
-- Protected regions are a flat muted fill, not a hatch (kept simple for drawing performance).
-- Centre/symmetric display exists for a multi-axis mask but is unreachable today: Smart Scale only
-  engages for exactly one axis, and this project has no Alt/centre-scale mode for it.
-- The dimension text sits at the centre of the object rather than beside the stretch region.
-- Drawing itself is not unit-tested pixel-wise; tests assert the recorded draw calls and the data.
+- Right-click an X/Y/Z scale handle and choose **Edit Smart Scale Zone**. This enters a mode for
+  only that axis.
+- Two draggable boundaries are shown, `[protected] | [stretch] | [protected]`, with a subtle fill
+  between them. They set the profile's `inner_min` / `inner_max`, stay inside the object's range and
+  cannot cross (minimum stretch zone: 5 mm).
+- **Enter**, or a click away from both boundaries, applies the zone as one Undo step. **Esc**
+  cancels and keeps the previous zone. Opening the menu or merely dragging records no Undo.
+- The zone is saved on the object per axis and per orientation (Global / Object / each custom
+  orientation), as the two protected widths, and the existing Smart Scale solver uses it in place of
+  the auto-detected profile. There is no separate scaling path.
 
 ## Pivot editing
 

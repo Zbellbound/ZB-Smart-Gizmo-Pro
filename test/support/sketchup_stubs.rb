@@ -1308,6 +1308,18 @@ module Sketchup
     def clear_draw_calls
       @draw_calls = []
     end
+
+    # Test-double-only side view looking along +Y: a world point (x, y, z)
+    # appears at screen (x, z), and a screen point (x, y) casts a ray from
+    # (x, -1000, y) heading +Y -- enough to drive axis-boundary picking and
+    # dragging for the X and Z axes with plain numbers.
+    def screen_coords(point)
+      Geom::Point3d.new(point.x, point.z, 0)
+    end
+
+    def pickray(x, y)
+      [Geom::Point3d.new(x, -1000.0, y), Geom::Vector3d.new(0, 1, 0)]
+    end
   end
 
   # Real Sketchup::InputPoint: the standard SketchUp tool-authoring pattern
