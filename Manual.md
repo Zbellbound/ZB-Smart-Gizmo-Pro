@@ -132,6 +132,23 @@ Smart Scale is a structure-aware alternative to normal SketchUp scale.
 - Nested group/component structures are supported better than exploded loose geometry.
 - If the object has no useful structure to preserve, scaling may behave more like default scale.
 
+## Smart Scale Zones
+
+Choose exactly where Smart Scale is allowed to stretch.
+
+- Smart Scale must be turned on in Preferences.
+- Right-click a Smart Scale X/Y/Z scale handle and choose `Edit Smart Scale Zone`.
+- Two draggable boundaries split that axis into `[ protected ] | [ stretch ] | [ protected ]`. Drag
+  them to choose exactly where scaling is allowed.
+- Press `Enter` or click away from both boundaries to confirm; press `Esc` to cancel and keep the
+  previous zone.
+- Then scale with the normal Smart Scale handle. Protected areas keep their size, only the stretch
+  zone changes length, and geometry after it moves with the scaled end.
+- The zone is saved with the object, separately for each axis and orientation (Global, Object,
+  custom).
+- Nested groups, components, and curved geometry are handled automatically. Curves and arcs move as
+  whole pieces and are never stretched.
+
 ## Pivot
 
 - Drag the center pivot control to reposition the gizmo origin.

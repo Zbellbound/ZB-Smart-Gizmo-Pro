@@ -483,6 +483,20 @@ module Zbellbound
                 </ul>
               </div>
 
+              <h2>Smart Scale Zones</h2>
+              <div class="card">
+                <h3>Choose Where It Stretches</h3>
+                <ul>
+                  <li>Smart Scale must be turned on in Preferences.</li>
+                  <li>Right-click a Smart Scale X, Y, or Z scale handle and choose <code>Edit Smart Scale Zone</code>.</li>
+                  <li>Two draggable boundaries split that axis into <code>[ protected ] | [ stretch ] | [ protected ]</code>. Drag them to choose exactly where scaling is allowed.</li>
+                  <li>Press <code>Enter</code> or click away from both boundaries to confirm. Press <code>Esc</code> to cancel and keep the previous zone.</li>
+                  <li>Then scale with the normal Smart Scale handle. Protected areas keep their size, only the stretch zone changes length, and geometry after it moves with the scaled end.</li>
+                  <li>The zone is saved with the object, separately for each axis and orientation (Global, Object, custom).</li>
+                  <li>Nested groups, components, and curved geometry are handled automatically. Curves and arcs move as whole pieces and are never stretched.</li>
+                </ul>
+              </div>
+
               <h2>Pivot</h2>
               <div class="grid">
                 <div class="card">

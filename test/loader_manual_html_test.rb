@@ -115,6 +115,18 @@ class LoaderManualHtmlTest < Minitest::Test
 
   # -- Pivot --------------------------------------------------------------
 
+  def test_documents_smart_scale_zones
+    html = manual_html
+
+    assert_match(/<h2>Smart Scale Zones<\/h2>/, html)
+    assert_match(/Edit Smart Scale Zone/, html)
+    assert_match(/\[ protected \] \| \[ stretch \] \| \[ protected \]/, html)
+    assert_match(/Smart Scale must be turned on in Preferences/, html)
+    assert_match(/Esc/, html)
+    assert_match(/separately for each axis and orientation/, html)
+    assert_match(/curved geometry are handled automatically/, html)
+  end
+
   def test_documents_pivot
     html = manual_html
 
