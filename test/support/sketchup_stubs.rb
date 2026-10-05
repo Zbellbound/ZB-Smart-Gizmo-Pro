@@ -4,6 +4,9 @@
 # Only implements the subset of behavior the plugin code actually touches.
 # Not a general-purpose SketchUp API stub.
 
+GL_LINES = 1 unless defined?(GL_LINES)
+GL_QUADS = 7 unless defined?(GL_QUADS)
+
 module Geom
   class Vector3d
     attr_reader :x, :y, :z
@@ -703,8 +706,25 @@ module Sketchup
     attr_accessor :last_vcb_label, :last_vcb_value
   end
 
+  # Real Sketchup::Color: red/green/blue/alpha readers and to_a, enough for
+  # drawing code that rebuilds a colour with a different alpha.
   class Color
-    def initialize(*args); end
+    attr_reader :red, :green, :blue, :alpha
+
+    def initialize(red = 0, green = 0, blue = 0, alpha = 255)
+      @red = red
+      @green = green
+      @blue = blue
+      @alpha = alpha
+    end
+
+    def to_a
+      [red, green, blue, alpha]
+    end
+
+    def ==(other)
+      other.is_a?(Color) && to_a == other.to_a
+    end
   end
 
   # Real SketchUp API: a single named attribute dictionary attached to an
@@ -1264,6 +1284,29 @@ module Sketchup
 
     def tooltip=(_value)
       nil
+    end
+
+    # Test-double-only recording of the drawing calls the overlay makes, so
+    # a spec can assert what would have been drawn (colour, primitive,
+    # points, text) without a GL context. Real View#draw/draw_text return
+    # nothing observable; each call is appended to #draw_calls in order,
+    # carrying the colour and line width in effect at that moment.
+    attr_accessor :drawing_color, :line_width, :line_stipple
+    attr_reader :draw_calls
+
+    def draw(mode, points)
+      (@draw_calls ||= []) << { type: :draw, mode: mode, points: points.flatten,
+                                color: drawing_color, width: line_width }
+      nil
+    end
+
+    def draw_text(point, text, _options = {})
+      (@draw_calls ||= []) << { type: :text, point: point, text: text, color: drawing_color }
+      nil
+    end
+
+    def clear_draw_calls
+      @draw_calls = []
     end
   end
 

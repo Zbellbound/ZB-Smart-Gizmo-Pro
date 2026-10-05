@@ -663,6 +663,14 @@ module Zbellbound::SmartGizmoPro
       @smart_scale_gesture = nil
       @smart_scale_gesture_data = nil
       @smart_scale_gesture_states = nil
+      # The Smart Scale Zones hover preview's own cache (see
+      # smart_scale_hover_state_for) -- cleared here too since this method
+      # already runs at every point the zone overlay must disappear
+      # immediately: selection change (clear_edit_state), a new drag
+      # starting (on_transform_start), a drag committing (on_transform_end),
+      # and Esc mid-drag (onCancel). No separate wiring needed.
+      @smart_scale_zone_hover_key = nil
+      @smart_scale_zone_hover_state = nil
     end
 
     def activate_native_move_tool(view)
@@ -3404,6 +3412,358 @@ module Zbellbound::SmartGizmoPro
       @smart_scale_session = nil
     end
 
+    # -- Smart Scale Zones -- visual prototype (Stage 1, read-only) ---------
+    #
+    # Shows, as transient overlay graphics only, which part of the selected
+    # object Smart Scale will keep fixed and which part it will stretch,
+    # which axis/direction is active, and the resulting dimension -- both
+    # while hovering an eligible scale handle and live during an actual
+    # drag. Every value drawn is read from the SAME SmartScaleGestureState
+    # (and the same helper methods) the real Smart Scale drag already uses
+    # (profile/axis_id/root_to_solver_transformation/reference_length/
+    # ratio): nothing here recomputes stretch/protected classification,
+    # anchor position, or the scaled result independently. See
+    # Features.md's "Smart Scale Zones -- visual prototype" section for the
+    # full design notes and current limitations.
+    #
+    # Stage 1 is visualization only: no new Tool, no clickable planes, no
+    # editable dimension, no change to SmartScaleApplier or any other Scale
+    # behavior.
+
+    # Same RGB values as Manipulator::CLR_X_AXIS/Y/Z in gizmo.rb (kept as
+    # plain values here so this file does not depend on gizmo.rb being
+    # loaded), so the zones match the gizmo handles' own axis colours.
+    SMART_SCALE_ZONE_AXIS_RGB = { x: [255, 0, 0], y: [0, 128, 0], z: [0, 0, 255] }.freeze
+    SMART_SCALE_ZONE_FILL_ALPHA = 70
+    SMART_SCALE_ZONE_PROTECTED_COLOR = Sketchup::Color.new(128, 128, 128, 60).freeze
+
+    # The state to visualize this frame, or nil to draw nothing: reused
+    # verbatim from whichever of the two sources already has it --
+    # @smart_scale_gesture (the real on_transform callback's own cache,
+    # read fresh every frame, never rebuilt here) while a drag is actually
+    # in progress, or a small cache of our own (smart_scale_hover_state_for)
+    # while only hovering. Deliberately returns nil (hide the zones) rather
+    # than raising for every kind of "not applicable right now" -- disabled,
+    # no/multi selection, native tool active, no eligible axis hovered or
+    # dragging, or an invalid/stale state -- matching "if visualization data
+    # is unavailable or invalid, hide the zones and let Smart Scale continue
+    # safely".
+    def smart_scale_zone_state
+      return nil unless smart_scale_enabled?
+      return nil unless selected_one_object?
+      return nil if @native_tool_override
+      return nil unless @gizmo
+
+      active_axis_id = active_smart_scale_axis_id
+      if active_axis_id
+        return @smart_scale_gesture if @smart_scale_gesture&.valid?
+
+        # The very first frame of a drag: on_transform_start has run but
+        # on_transform (which builds @smart_scale_gesture) hasn't fired
+        # yet. Fall back to the same cached hover-style lookup rather than
+        # drawing nothing for that one frame.
+        return smart_scale_hover_state_for(active_axis_id)
+      end
+
+      hovered_axis_id = hovered_smart_scale_axis_id
+      return nil unless hovered_axis_id
+
+      smart_scale_hover_state_for(hovered_axis_id)
+    end
+
+    # Which axis's scale handle is CURRENTLY being dragged, if any -- read
+    # from the real per-axis handle state (Axis#scale_gizmo#active?, added
+    # as a plain reader in gizmo.rb), never tracked independently here.
+    def active_smart_scale_axis_id
+      return nil unless @gizmo.respond_to?(:axes)
+
+      axis = @gizmo.axes.find { |a| a.respond_to?(:scale_gizmo) && a.scale_gizmo&.active? }
+      axis&.id
+    end
+
+    # Which axis's scale handle the mouse is CURRENTLY hovering (prepick,
+    # before any drag), if any -- same real per-axis handle state as
+    # active_smart_scale_axis_id, just the hover flag instead of the drag
+    # flag. Both flags are already maintained by the existing onMouseMove
+    # chain (Axis#onMouseMove -> ScaleGizmo#onMouseMove); nothing new is
+    # tracked here.
+    def hovered_smart_scale_axis_id
+      return nil unless @gizmo.respond_to?(:axes)
+
+      axis = @gizmo.axes.find { |a| a.respond_to?(:scale_gizmo) && a.scale_gizmo&.mouse_active? }
+      axis&.id
+    end
+
+    # Builds (and caches) a READ-ONLY preview state for hovering axis_id,
+    # using the exact same profile/classification builder a real drag uses
+    # (build_smart_scale_gesture_state_for_entity) -- never a separate
+    # calculation. Deliberately uses @selection[0] directly rather than
+    # smart_scale_entity/prepare_smart_scale_entity: that wrapper calls
+    # make_unique on a shared component definition, which -- outside the
+    # Undo operation a real drag opens in on_transform_start -- would
+    # silently create its own implicit Undo entry from mere hovering. A
+    # merely-hovered preview must stay strictly read-only; the real drag
+    # still uniques the definition properly for itself the moment it
+    # actually starts.
+    #
+    # Cached per [entity, axis_id] so repeated draw() calls while the mouse
+    # sits still over the same handle (many times a second) do not re-scan
+    # the entity's geometry each frame -- only entering a different handle,
+    # or a different object, rebuilds it. Cleared in reset_smart_scale_
+    # gesture, so it never outlives the hover it was built for.
+    def smart_scale_hover_state_for(axis_id)
+      entity = @selection[0]
+      return nil unless entity&.valid?
+
+      cache_key = [entity, axis_id]
+      if @smart_scale_zone_hover_key == cache_key && @smart_scale_zone_hover_state&.valid?
+        return @smart_scale_zone_hover_state
+      end
+
+      mask = [axis_id == :x, axis_id == :y, axis_id == :z]
+      # A real (non-nil), indexable stand-in for the enriched Scale data
+      # tuple so build_smart_scale_gesture_state_for_entity's `data &&`
+      # guards (anchor_point/gizmo_transformation, :basic mode only) still
+      # compute from @gizmo.bounds via scale_anchor_point/scale_gizmo_
+      # transformation's own nil-data fallback, instead of short-circuiting
+      # to nil just because no real drag has produced a data tuple yet.
+      data = [:scale, nil, 1.0, mask, nil, nil, nil]
+      state = build_smart_scale_gesture_state_for_entity(entity, axis_id, mask, data)
+
+      @smart_scale_zone_hover_key = cache_key
+      @smart_scale_zone_hover_state = state
+      state
+    end
+
+    def smart_scale_zone_axis_color(axis_id, alpha = 255)
+      rgb = SMART_SCALE_ZONE_AXIS_RGB[axis_id]
+      return nil unless rgb
+
+      Sketchup::Color.new(rgb[0], rgb[1], rgb[2], alpha)
+    end
+
+    # The overall LOCAL ("root") bounds of the state's geometry, expressed
+    # as [min_point, max_point] in SOLVER space (the same space state's own
+    # profile min/inner_min/inner_max/max already live in) -- the source for
+    # both the zone slabs' cross-section (the two axes NOT being scaled)
+    # and, when there is no profile (:basic mode), the whole-object
+    # anchor-only outline. Reuses entity.definition.bounds exactly as
+    # gizmo_state_for_current_selection already does for the gizmo's own
+    # bounds -- never a fresh geometry scan.
+    def smart_scale_zone_cross_bounds(entity, root_to_solver_transformation)
+      return nil unless entity.respond_to?(:definition)
+
+      bb = entity.definition.bounds
+      return nil unless bb && !bb.empty?
+
+      points = 0.upto(7).map { |i| transform_root_point_to_solver(bb.corner(i), root_to_solver_transformation) }
+      xs = points.map(&:x)
+      ys = points.map(&:y)
+      zs = points.map(&:z)
+      [Geom::Point3d.new(xs.min, ys.min, zs.min), Geom::Point3d.new(xs.max, ys.max, zs.max)]
+    rescue StandardError => e
+      warn_overlay_issue('compute smart scale zone cross bounds', e)
+      nil
+    end
+
+    # One axis-aligned slab, in SOLVER space, spanning axis_min..axis_max
+    # along axis_id and the full cross_min..cross_max extent on the other
+    # two axes -- used for each of the (up to) three zone boxes (left
+    # protected / middle stretch / right protected) and, in :basic mode,
+    # the single whole-object box.
+    def smart_scale_zone_slab_bounds(axis_id, axis_min, axis_max, cross_min, cross_max)
+      lo, hi = case axis_id
+               when :x
+                 [Geom::Point3d.new(axis_min, cross_min.y, cross_min.z), Geom::Point3d.new(axis_max, cross_max.y, cross_max.z)]
+               when :y
+                 [Geom::Point3d.new(cross_min.x, axis_min, cross_min.z), Geom::Point3d.new(cross_max.x, axis_max, cross_max.z)]
+               when :z
+                 [Geom::Point3d.new(cross_min.x, cross_min.y, axis_min), Geom::Point3d.new(cross_max.x, cross_max.y, axis_max)]
+               end
+      bb = Geom::BoundingBox.new
+      bb.add(lo)
+      bb.add(hi)
+      bb
+    end
+
+    # The 4 corner points (in SOLVER space, not yet transformed to world) of
+    # the single face of the overall cross-section at axis_id == axis_value
+    # -- used to draw the stronger anchor-side boundary line.
+    def smart_scale_zone_face_points(axis_id, axis_value, cross_min, cross_max)
+      case axis_id
+      when :x
+        [Geom::Point3d.new(axis_value, cross_min.y, cross_min.z), Geom::Point3d.new(axis_value, cross_max.y, cross_min.z),
+         Geom::Point3d.new(axis_value, cross_max.y, cross_max.z), Geom::Point3d.new(axis_value, cross_min.y, cross_max.z)]
+      when :y
+        [Geom::Point3d.new(cross_min.x, axis_value, cross_min.z), Geom::Point3d.new(cross_max.x, axis_value, cross_min.z),
+         Geom::Point3d.new(cross_max.x, axis_value, cross_max.z), Geom::Point3d.new(cross_min.x, axis_value, cross_max.z)]
+      when :z
+        [Geom::Point3d.new(cross_min.x, cross_min.y, axis_value), Geom::Point3d.new(cross_max.x, cross_min.y, axis_value),
+         Geom::Point3d.new(cross_max.x, cross_max.y, axis_value), Geom::Point3d.new(cross_min.x, cross_max.y, axis_value)]
+      end
+    end
+
+    # The anchored/fixed end along axis_id, as :min or :max (which boundary
+    # of profile -- or, in :basic mode, of the cross bounds -- stays put).
+    # Both scale_anchor_point (:basic mode's real scale transform, which
+    # anchors the gizmo-local MINIMUM corner along the scaled axis) and
+    # SmartScaleApplier#apply!'s own frame-mode vertex remapping (a vertex
+    # at or below profile[:inner_min] keeps its value unchanged, i.e. the
+    # profile[:min] end never moves, while the profile[:inner_max] end
+    # translates by `delta` to follow the stretch) always treat the
+    # profile/bounds-MINIMUM end as the fixed side -- Smart Scale's handles
+    # only ever drag in the positive axis direction, so the negative end is
+    # always what stays behind. This reads that existing invariant rather
+    # than recomputing anchor logic independently.
+    #
+    # The one case this project's current single-axis-only Smart Scale
+    # masking (smart_scale_axis_id requires exactly one true axis) cannot
+    # reach today is a true multi-axis/centre-anchored mask; if mask ever
+    # carries more than one true axis in the future, the centre is treated
+    # as the fixed point and both ends are reported as "stretching" (see
+    # smart_scale_zone_anchor_side's :center return and
+    # draw_smart_scale_zone_preview's handling of it).
+    def smart_scale_zone_anchor_side(mask)
+      return :center if mask && mask.count(true) > 1
+
+      :min
+    end
+
+    def draw_smart_scale_zone_preview(view)
+      state = smart_scale_zone_state
+      return unless state
+
+      entity = state.entity
+      return unless entity&.valid?
+
+      rts = state.root_to_solver_transformation
+      cross_min, cross_max = smart_scale_zone_cross_bounds(entity, rts)
+      return unless cross_min && cross_max
+
+      # SOLVER space -> WORLD space in one combined transformation, so every
+      # box/point built in solver coordinates below needs only this single
+      # transform, exactly like draw_bounds's own `tr` parameter.
+      combined_tr = entity.transformation * rts.inverse
+
+      axis_id = state.axis_id
+      axis_color = smart_scale_zone_axis_color(axis_id)
+      anchor_side = smart_scale_zone_anchor_side(state.mask)
+
+      if state.profile
+        profile = smart_scale_zone_live_profile(state, anchor_side)
+        draw_smart_scale_zone_profile(view, profile, axis_id, cross_min, cross_max, combined_tr, axis_color, anchor_side)
+      else
+        # :basic mode: Smart Scale will move the WHOLE object uniformly --
+        # there is no protected/stretch split to show, only the active
+        # axis and the anchored side, exactly as the task's own "only show
+        # protected regions Smart Scale actually preserves" rule requires.
+        axis_min = point_axis_value(cross_min, axis_id)
+        axis_max = point_axis_value(cross_max, axis_id)
+        anchor_value = anchor_side == :max ? axis_max : axis_min
+        draw_smart_scale_zone_anchor_face(view, axis_id, anchor_value, cross_min, cross_max, combined_tr, axis_color)
+      end
+
+      draw_bounds(view, entity.definition.bounds, entity.transformation, axis_color)
+      draw_smart_scale_zone_dimension_text(view, state, entity, combined_tr, axis_id, cross_min, cross_max)
+    rescue StandardError => e
+      warn_overlay_issue('draw smart scale zone preview', e)
+      nil
+    end
+
+    # The profile boundaries as they stand RIGHT NOW. The profile itself is
+    # captured once, in the original (pre-drag) geometry; SmartScaleApplier#
+    # apply! then leaves the anchored end's vertices where they were and
+    # translates everything at/above profile[:inner_max] by
+    # `delta = (max - min) * (ratio - 1)` (see apply!), so while a drag is
+    # live the right-hand protected zone and the stretched middle sit
+    # `delta` further along than the original profile says. state.ratio is
+    # the ratio apply! itself last applied (it is only ever set there), so
+    # this is exactly apply!'s own displacement, not an independent
+    # estimate -- the tests compare it against the real mutated geometry.
+    # While merely hovering, ratio is 1.0 and the profile is returned
+    # unchanged. :center (unreachable today -- see smart_scale_zone_anchor_
+    # side) splits the displacement evenly between both ends.
+    def smart_scale_zone_live_profile(state, anchor_side)
+      profile = state.profile
+      delta = (profile[:max] - profile[:min]) * (state.ratio - 1.0)
+      return profile if delta.zero?
+
+      if anchor_side == :center
+        half = delta / 2.0
+        profile.merge(min: profile[:min] - half, inner_min: profile[:inner_min] - half,
+                      inner_max: profile[:inner_max] + half, max: profile[:max] + half)
+      else
+        profile.merge(inner_max: profile[:inner_max] + delta, max: profile[:max] + delta)
+      end
+    end
+
+    def draw_smart_scale_zone_profile(view, profile, axis_id, cross_min, cross_max, combined_tr, axis_color, anchor_side)
+      left_bb = smart_scale_zone_slab_bounds(axis_id, profile[:min], profile[:inner_min], cross_min, cross_max)
+      middle_bb = smart_scale_zone_slab_bounds(axis_id, profile[:inner_min], profile[:inner_max], cross_min, cross_max)
+      right_bb = smart_scale_zone_slab_bounds(axis_id, profile[:inner_max], profile[:max], cross_min, cross_max)
+
+      draw_smart_scale_zone_fill(view, left_bb, combined_tr, SMART_SCALE_ZONE_PROTECTED_COLOR)
+      draw_smart_scale_zone_fill(view, right_bb, combined_tr, SMART_SCALE_ZONE_PROTECTED_COLOR)
+      draw_smart_scale_zone_fill(view, middle_bb, combined_tr, smart_scale_zone_axis_color(axis_id, SMART_SCALE_ZONE_FILL_ALPHA))
+
+      anchor_value = case anchor_side
+                     when :min then profile[:min]
+                     when :max then profile[:max]
+                     else nil # :center -- no single anchor face to highlight
+                     end
+      return unless anchor_value
+
+      draw_smart_scale_zone_anchor_face(view, axis_id, anchor_value, cross_min, cross_max, combined_tr, axis_color)
+    end
+
+    def draw_smart_scale_zone_fill(view, bb, tr, color)
+      return unless bb && !bb.empty?
+
+      pts = 0.upto(7).map { |i| bb.corner(i).transform(tr) }
+      top = [pts[0], pts[2], pts[3], pts[1]]
+      bottom = [pts[4], pts[6], pts[7], pts[5]]
+      faces = [
+        top, bottom,
+        [top[0], top[1], bottom[1], bottom[0]],
+        [top[1], top[2], bottom[2], bottom[1]],
+        [top[2], top[3], bottom[3], bottom[2]],
+        [top[3], top[0], bottom[0], bottom[3]]
+      ]
+
+      view.drawing_color = color
+      faces.each { |face| view.draw(GL_QUADS, face) }
+    end
+
+    def draw_smart_scale_zone_anchor_face(view, axis_id, axis_value, cross_min, cross_max, combined_tr, axis_color)
+      return unless axis_color
+
+      pts = smart_scale_zone_face_points(axis_id, axis_value, cross_min, cross_max).map { |pt| pt.transform(combined_tr) }
+      view.line_width = 4
+      view.line_stipple = ''
+      view.drawing_color = axis_color
+      view.draw(GL_LINES, (pts + [pts[0]]).each_cons(2).to_a.flatten)
+    end
+
+    # Text dimension reusing format_scale_display exactly -- the same
+    # formatter the Scale popup/Measurements box already use for "the
+    # current dimension", so this prototype never introduces a second,
+    # possibly-inconsistent number format. state.ratio is 1.0 (the
+    # SmartScaleGestureState default) whenever this is a hover preview
+    # rather than a live drag, which is exactly the CURRENT dimension --
+    # correct for both cases with no branching needed.
+    def draw_smart_scale_zone_dimension_text(view, state, entity, combined_tr, axis_id, cross_min, cross_max)
+      text = format_scale_display(state.ratio, state.reference_length)
+      return if text.nil? || text.empty?
+
+      mid = Geom::Point3d.new(
+        (cross_min.x + cross_max.x) / 2.0,
+        (cross_min.y + cross_max.y) / 2.0,
+        (cross_min.z + cross_max.z) / 2.0
+      )
+      anchor = mid.transform(combined_tr)
+      view.draw_text(anchor, text)
+    end
+
     def stop
     end
 
@@ -3788,6 +4148,11 @@ module Zbellbound::SmartGizmoPro
       return if @native_tool_override
       return unless active_gizmo? && @gizmo
       sync_gizmo_refresh
+
+      # Transient, read-only Smart Scale Zones prototype graphics (Stage 1);
+      # drawn first so the gizmo's own handles stay on top. Draws nothing
+      # unless a Smart Scale-eligible scale handle is hovered or dragging.
+      draw_smart_scale_zone_preview(view)
 
       @gizmo.draw(view) if @gizmo && @selection.length > 0
 

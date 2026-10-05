@@ -27,15 +27,40 @@ module Zbellbound::SmartGizmoPro
       @origin_control ||= FakeOriginControl.new(0)
     end
 
+    # A minimal stand-in for a real Axis's own scale handle -- just enough
+    # for the Smart Scale Zones preview's hover/active axis lookup
+    # (axis.scale_gizmo.mouse_active?/active?) to work against a synthetic
+    # gizmo. Both default to false; tests flip one or the other directly
+    # (e.g. `axis.scale_gizmo.mouse_active = true`).
+    FakeScaleHandle = Struct.new(:mouse_active, :active) do
+      def initialize(mouse_active: false, active: false)
+        super(mouse_active, active)
+      end
+
+      def mouse_active?
+        mouse_active == true
+      end
+
+      def active?
+        active == true
+      end
+    end
+
     # A minimal stand-in for the three real Axis objects (each of which
-    # exposes a #direction) -- needed so axis_id_for_direction (used by
-    # the on_click move dialog, e.g. to build the "Number of copies"
-    # field) can resolve a clicked direction to :x/:y/:z instead of
-    # crashing on `[].x.direction`.
-    FakeAxis = Struct.new(:direction)
+    # exposes #direction, #id and #scale_gizmo) -- needed so
+    # axis_id_for_direction (used by the on_click move dialog, e.g. to
+    # build the "Number of copies" field) can resolve a clicked direction
+    # to :x/:y/:z instead of crashing on `[].x.direction`, and so the
+    # Smart Scale Zones preview's hover/active axis lookup has a real
+    # #id/#scale_gizmo to query instead of crashing on a bare #direction.
+    FakeAxis = Struct.new(:direction, :id, :scale_gizmo) do
+      def initialize(direction, id = nil, scale_gizmo = nil)
+        super(direction, id, scale_gizmo || FakeScaleHandle.new)
+      end
+    end
 
     def axes
-      @axes ||= [FakeAxis.new(X_AXIS), FakeAxis.new(Y_AXIS), FakeAxis.new(Z_AXIS)]
+      @axes ||= [FakeAxis.new(X_AXIS, :x), FakeAxis.new(Y_AXIS, :y), FakeAxis.new(Z_AXIS, :z)]
     end
 
     def on_origin_change(&block)

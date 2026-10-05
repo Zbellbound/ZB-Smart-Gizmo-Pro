@@ -787,7 +787,14 @@ module Zbellbound::SmartGizmoPro
 
     attr_reader(:origin, :direction)
     attr_reader(:parent, :id)
-    
+    # Read-only access to this axis's own scale handle, so callers (the
+    # Smart Scale Zones preview) can ask specifically "is THIS axis's scale
+    # handle hovered/active right now" via scale_gizmo.mouse_active?/
+    # active? -- distinct from Axis#mouse_active?/#active?, which combine
+    # all three (move/rotate/scale) handles. Read-only: nothing outside
+    # this class may replace or drive the handle itself.
+    attr_reader(:scale_gizmo)
+
     # @param [Geom::Point3d] origin
     # @param [Geom::Vector3d] direction
     # @param [Sketchup::Color] color
