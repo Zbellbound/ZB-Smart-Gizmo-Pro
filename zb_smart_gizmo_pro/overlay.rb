@@ -3198,7 +3198,12 @@ module Zbellbound::SmartGizmoPro
       # different offsets — that would break the curve definition while
       # leaving the vertex positions stale. Only straight edges contribute
       # to the smart scale gesture.
-      edges = root_entities.grep(Sketchup::Edge).reject(&:curve)
+      # A saved Smart Scale Zone moves ALL geometry (curved edges included),
+      # so everything beyond the stretch zone travels with the scaling; only
+      # auto-detection ignores curve vertices.
+      zone_override = parent_root_to_solver ? nil : smart_scale_zone_override(entity, axis_id)
+      edges = root_entities.grep(Sketchup::Edge)
+      edges = edges.reject(&:curve) unless zone_override
 
       child_instances = collect_nested_smart_scale_instances(root_entities, axis_id, [], root_to_solver_transformation)
 
@@ -3225,7 +3230,6 @@ module Zbellbound::SmartGizmoPro
 
       # A saved Smart Scale Zone replaces the auto-detected profile; only
       # the root entity has one (nested children keep auto-detection).
-      zone_override = parent_root_to_solver ? nil : smart_scale_zone_override(entity, axis_id)
       profile = zone_override && smart_scale_zone_profile_with_override(axis_id, profile_points, zone_override)
       profile ||= smart_scale_profile_from_part_ranges(
         axis_id,
@@ -3438,7 +3442,8 @@ module Zbellbound::SmartGizmoPro
     # Smallest stretch zone the editor allows; same floor SmartScaleApplier
     # already enforces on the stretch zone while scaling.
     SMART_SCALE_ZONE_MIN_GAP = SmartScaleApplier::MIN_INNER_OPENING
-    SMART_SCALE_ZONE_PICK_RADIUS = 12
+    # Generous on purpose: the drawn boundary stays slim, the grab area does not.
+    SMART_SCALE_ZONE_PICK_RADIUS = 30
     SMART_SCALE_ZONE_RETURN_KEY = 13
 
     # -- Persistence -----------------------------------------------------
