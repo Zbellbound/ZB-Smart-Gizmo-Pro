@@ -6,6 +6,16 @@ then again after the folder was cleaned up post-release.
 
 ## Current contents
 
+**Updated 2026-10-05 -- 1.5.6 release prep (not yet built, tagged or submitted).** `main` carries
+Smart Scale Zones (merge `2a8eb37`; feature commit `093943a`): right-click an X/Y/Z scale handle ->
+`Edit Smart Scale Zone`, two draggable zone boundaries, saved per axis and orientation on the
+selected object, applied recursively to nested raw geometry with rigid curves, batched writes and a
+write-back safety guard. Smart Scale without a saved zone is unchanged from 1.5.5. Confirmed in
+live SketchUp testing, including a nested Dynamic Component door. `PLUGIN_NAME`, `PLUGIN_ID`, the
+Extension Warehouse UUID, the preference namespace and licensing are unchanged. The approved
+production package remains `ZB_Smart_Gizmo_Pro_1.5.5_Warehouse_Final.rbz` below until a 1.5.6
+package is built from the release commit and passes the gate.
+
 **Updated 2026-09-29** — **1.5.5 is the approved, verified production package for
 `ZB Smart Gizmo Pro`.** It adds custom per-instance gizmo orientation: right-click the gizmo
 (exactly one Group/ComponentInstance selected) for `Set Gizmo Orientation by 3 Points...` (three

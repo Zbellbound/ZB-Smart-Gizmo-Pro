@@ -145,10 +145,7 @@ Smart Scale is a structure-aware alternative to normal SketchUp scale.
 - Plain geometry can fall back to a simpler scale mode when there is no useful structure to preserve.
 - Copied Dynamic Components are handled more safely by uniquing the copied component tree before Smart Scale works on it.
 
-### Smart Scale Zone editing (Stage 2, DEV builds only)
-
-> **Status: development prototype**, present in DEV test builds. Not in the user manual. Editable
-> dimensions (Stage 3) are not started.
+### Smart Scale Zone editing (1.5.6)
 
 Smart Scale enabled in Preferences only makes the feature available; **nothing is drawn on hover or
 during a normal drag.**
@@ -160,9 +157,18 @@ during a normal drag.**
   cannot cross (minimum stretch zone: 5 mm).
 - **Enter**, or a click away from both boundaries, applies the zone as one Undo step. **Esc**
   cancels and keeps the previous zone. Opening the menu or merely dragging records no Undo.
-- The zone is saved on the object per axis and per orientation (Global / Object / each custom
-  orientation), as the two protected widths, and the existing Smart Scale solver uses it in place of
-  the auto-detected profile. There is no separate scaling path.
+- The zone is saved on the selected object per axis and per orientation (Global / Object / each
+  custom orientation), as the two protected widths, and the existing Smart Scale solver uses it in
+  place of the auto-detected profile. There is no separate scaling path.
+- With a saved zone, the geometry of nested groups and components at any depth is deformed in
+  place: nothing before the stretch zone changes, the stretch zone stretches, and everything after
+  it moves by the stretch amount. No group or component is uniformly scaled.
+- Curves and arcs are never deformed: each is moved as one rigid unit, with the vertices it shares
+  with other edges.
+- Geometry is written in one batch per group/component, and a frame that sees no stretch writes
+  nothing. A safety check restores the geometry and cancels the gesture if a write does not land
+  where it was computed.
+- Without a saved zone, Smart Scale behaves exactly as in 1.5.5.
 
 ## Pivot editing
 
