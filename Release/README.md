@@ -6,6 +6,19 @@ then again after the folder was cleaned up post-release.
 
 ## Current contents
 
+**Updated 2026-10-15 -- 1.5.7 release candidate (tagged `v1.5.7`; not yet submitted to the Extension Warehouse).** Fixes the Extension
+Warehouse Undo-stack rejection: a Ctrl-drag copy followed by `/N` or `xN` in Measurements is now ONE
+Undo entry instead of `Transform` + `Copy Array`. The array edit no longer relies on SketchUp merging a
+transparent operation; it replaces the drag's own undo entry and rebuilds the complete result in one
+`Copy Array` operation, and is guarded so it can never undo an unrelated operation (all tracked copies must
+still be alive, and any other model transaction disables the replace in favor of the previous behavior).
+Failure paths abort only an operation that is still open. Confirmed in live SketchUp testing. Only
+`overlay.rb` and `observer.rb` changed; `PLUGIN_NAME`, `PLUGIN_ID`, the Extension Warehouse UUID,
+preference namespace and licensing are unchanged from 1.5.6.
+
+- **`ZB_Smart_Gizmo_Pro_1.5.7_Warehouse_Candidate.rbz`** (219,081 B) -- 11 entries, byte-identical to the
+  tested working tree. `8b72c8fba2963607612f394ceb8d1ce9951ecaeac6afdab7e988d760b60a6303`
+
 **Updated 2026-10-05 -- 1.5.6 release prep (not yet built, tagged or submitted).** `main` carries
 Smart Scale Zones (merge `2a8eb37`; feature commit `093943a`): right-click an X/Y/Z scale handle ->
 `Edit Smart Scale Zone`, two draggable zone boundaries, saved per axis and orientation on the

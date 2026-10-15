@@ -109,7 +109,7 @@ class CtrlDragExternalArrayTest < Minitest::Test
     selected = @model.selection.to_a
     assert_equal 4, selected.length, 'original + endpoint (copy 1) + 2 more copies'
     assert_includes selected, group
-    assert_includes selected, endpoint, 'the endpoint copy must be reused, never recreated'
+    assert_equal 1, @model.undo_stack.length, 'the drag copy and the array must be ONE undo entry'
 
     xs = selected.map { |e| e.transformation.origin.x }.sort
     assert_in_delta 0, xs[0], 1e-6
@@ -165,7 +165,7 @@ class CtrlDragExternalArrayTest < Minitest::Test
     assert extras.none?(&:valid?), 'the x3 extra copies must be erased'
     selected = @model.selection.to_a
     assert_equal 2, selected.length, 'original + endpoint only'
-    assert_includes selected, endpoint
+    assert_equal 1, @model.undo_stack.length
     assert_equal 0, session_of(overlay)[:intermediates].length
   end
 
@@ -343,9 +343,8 @@ class CtrlDragExternalArrayTest < Minitest::Test
     assert extras_after_x3.none?(&:valid?), 'the x3 extras must be replaced, not kept alongside x4'
     session = session_of(overlay)
     assert_equal 3, session[:intermediates].length, 'x4 means 4 total copies -- endpoint + 3 extras'
-    assert_equal endpoint, session[:endpoint].first
-    assert endpoint.valid?
-    assert_in_delta 1000.mm, endpoint.transformation.origin.x, 1e-6, 'the endpoint must never move across re-edits'
+    assert_in_delta 1000.mm, session[:endpoint].first.transformation.origin.x, 1e-6,
+      'the endpoint must stay at the dragged distance across re-edits'
 
     xs = session[:intermediates].map { |e| e.transformation.origin.x }.sort
     assert_in_delta 2000.mm, xs[0], 1e-6
@@ -358,7 +357,8 @@ class CtrlDragExternalArrayTest < Minitest::Test
     assert_equal 0, aborts
 
     transparent_starts = @model.operation_log.count { |e| e[0] == :start && e[4] == true }
-    assert_equal 2, transparent_starts, 'each "xN" re-edit must request a transparent (undo-merging) operation'
+    assert_equal 0, transparent_starts, 'no reliance on a transparent merge'
+    assert_equal 1, @model.undo_stack.length, 'drag + x3 + x4 must be a single undo entry'
   end
 
   def test_slash_3_then_x3_switches_to_the_external_array
@@ -378,8 +378,8 @@ class CtrlDragExternalArrayTest < Minitest::Test
     assert_equal :external, session[:mode]
     assert_equal 3, session[:count]
     assert_equal 2, session[:intermediates].length
-    assert endpoint.valid?
-    assert_in_delta 3000.mm, endpoint.transformation.origin.x, 1e-6, 'the endpoint never moves, even across a mode switch'
+    assert_in_delta 3000.mm, session[:endpoint].first.transformation.origin.x, 1e-6,
+      'the endpoint stays at the dragged distance, even across a mode switch'
 
     xs = session[:intermediates].map { |e| e.transformation.origin.x }.sort
     assert_in_delta 6000.mm, xs[0], 1e-6, 'external mode repeats the fixed drag vector, not the /3 subdivision'
@@ -402,8 +402,7 @@ class CtrlDragExternalArrayTest < Minitest::Test
     session = session_of(overlay)
     assert_equal :internal, session[:mode]
     assert_equal 3, session[:count]
-    assert endpoint.valid?
-    assert_in_delta 3000.mm, endpoint.transformation.origin.x, 1e-6
+    assert_in_delta 3000.mm, session[:endpoint].first.transformation.origin.x, 1e-6
 
     xs = session[:intermediates].map { |e| e.transformation.origin.x }.sort
     assert_in_delta 1000.mm, xs[0], 1e-6, 'internal mode subdivides the fixed drag vector, not the x3 repetition'
@@ -445,8 +444,13 @@ class CtrlDragExternalArrayTest < Minitest::Test
     session = session_of(overlay)
     assert_equal 3, session[:count], 'count must remain at the pre-failure value'
     assert_equal :external, session[:mode]
-    assert_equal original_extras, session[:intermediates], 'the pre-failure extras must still be tracked'
-    assert original_extras.all?(&:valid?), 'old extras must not be erased until the replacement set is fully built'
+    assert_equal 2, session[:intermediates].length, 'the pre-failure array must be restored'
+    assert session[:intermediates].all?(&:valid?)
+    xs = session[:intermediates].map { |e| e.transformation.origin.x }.sort
+    assert_in_delta 2000.mm, xs[0], 1e-6
+    assert_in_delta 3000.mm, xs[1], 1e-6
+    assert_in_delta 1000.mm, session[:endpoint].first.transformation.origin.x, 1e-6
+    assert_equal 1, @model.undo_stack.length, 'a failed edit must still leave exactly one undo entry'
   end
 
   # -- Selection-observer timing protection ---------------------------------

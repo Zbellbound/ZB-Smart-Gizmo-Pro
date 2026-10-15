@@ -133,7 +133,7 @@ class CtrlDragInternalArrayTest < Minitest::Test
     selected = @model.selection.to_a
     assert_equal 4, selected.length, 'original + 2 intermediates + the endpoint'
     assert_includes selected, group
-    assert_includes selected, endpoint, 'the endpoint copy must be reused, never recreated'
+    assert_equal 1, @model.undo_stack.length, 'the drag copy and the array must be ONE undo entry'
 
     xs = selected.map { |e| e.transformation.origin.x }.sort
     assert_in_delta 0, xs[0], 1e-6
@@ -394,9 +394,8 @@ class CtrlDragInternalArrayTest < Minitest::Test
     assert intermediates_after_3.none?(&:valid?), 'the /3 intermediates must be replaced, not kept alongside /4'
     session = session_of(overlay)
     assert_equal 3, session[:intermediates].length, '/4 means 4 total copies -- 3 new intermediates + the endpoint'
-    assert_equal endpoint, session[:endpoint].first, 'the same endpoint object must still be tracked'
-    assert endpoint.valid?
-    assert_in_delta 3000.mm, endpoint.transformation.origin.x, 1e-6, 'the endpoint must never move across re-edits'
+    assert_in_delta 3000.mm, session[:endpoint].first.transformation.origin.x, 1e-6,
+      'the endpoint must stay at the full dragged distance across re-edits'
 
     xs = session[:intermediates].map { |e| e.transformation.origin.x }.sort
     assert_in_delta 750.mm, xs[0], 1e-6
@@ -408,10 +407,11 @@ class CtrlDragInternalArrayTest < Minitest::Test
     assert_equal 3, commits
     assert_equal 0, aborts
 
+    # No reliance on SketchUp merging a transparent operation: each edit
+    # replaces the newest undo entry, so the whole session is one Undo.
     transparent_starts = @model.operation_log.count { |e| e[0] == :start && e[4] == true }
-    assert_equal 2, transparent_starts,
-      'each "/N" re-edit must request a transparent (undo-merging) operation, matching the documented ' \
-      'Model#start_operation(op_name, disable_ui, next_transparent, transparent) signature'
+    assert_equal 0, transparent_starts
+    assert_equal 1, @model.undo_stack.length, 'drag + /3 + /4 must be a single undo entry'
   end
 
   # -- Mid-array failure: build-then-swap, never leaves a gap --------------
@@ -448,9 +448,14 @@ class CtrlDragInternalArrayTest < Minitest::Test
 
     session = session_of(overlay)
     assert_equal 3, session[:count], 'count must remain at the pre-failure value'
-    assert_equal original_intermediates, session[:intermediates], 'the pre-failure intermediates must still be tracked'
-    assert original_intermediates.all?(&:valid?),
-      'old intermediates must not be erased until the replacement set is fully built'
+    assert_equal 2, session[:intermediates].length, 'the pre-failure array must be restored'
+    assert session[:intermediates].all?(&:valid?)
+    xs = session[:intermediates].map { |e| e.transformation.origin.x }.sort
+    assert_in_delta 1000.mm, xs[0], 1e-6
+    assert_in_delta 2000.mm, xs[1], 1e-6
+    assert_in_delta 3000.mm, session[:endpoint].first.transformation.origin.x, 1e-6
+    assert session[:endpoint].all?(&:valid?)
+    assert_equal 1, @model.undo_stack.length, 'a failed edit must still leave exactly one undo entry'
   end
 
   # -- Metadata / attribute preservation ------------------------------------

@@ -779,9 +779,17 @@ module Sketchup
   # attribute_dictionaries, set_attribute and get_attribute are all
   # documented directly on Entity, not on Drawingelement.
   class Entity
+    # Undo-stack emulation (see Model#start_operation / Sketchup.undo):
+    # while a model operation is open, every Entity created is recorded
+    # in that operation's frame so a later Sketchup.undo can remove it.
+    class << self
+      attr_accessor :creation_sink
+    end
+
     def initialize
       @attribute_dictionaries = {}
       @deleted = false
+      Entity.creation_sink << self if Entity.creation_sink
     end
 
     def valid?
@@ -1425,11 +1433,16 @@ module Sketchup
     attr_accessor :selection
     attr_reader :operation_log, :tools
 
+    class << self
+      attr_accessor :current
+    end
+
     def initialize
       @selection = Selection.new
       @view = View.new(self)
       @operation_log = []
       @tools = Tools.new
+      Model.current = self
     end
 
     # Real Sketchup::Model#valid? is false once the model/document has been
@@ -1476,16 +1489,55 @@ module Sketchup
     # operation is currently on top of the undo stack -- logged here (not
     # otherwise modeled) so tests can confirm production code requests
     # that merge for the Ctrl-drag array re-edit path.
+    #
+    # Undo stack: each committed operation is one entry holding the
+    # entities it created, so Sketchup.undo (below) can undo exactly one
+    # entry. `transparent_merge` is false by default because that is what
+    # the Extension Warehouse reviewer actually observed in SketchUp (a
+    # transparent operation still produced its own undo entry) -- tests
+    # must not rely on the merge. Set true to model the documented merge.
+    attr_accessor :transparent_merge
+
     def start_operation(op_name, disable_ui = false, next_transparent = false, transparent = false)
       @operation_log << [:start, op_name, disable_ui, next_transparent, transparent]
+      @open_frame = { name: op_name, transparent: transparent, entities: [] }
+      Entity.creation_sink = @open_frame[:entities]
     end
 
     def commit_operation
       @operation_log << [:commit]
+      frame = @open_frame
+      @open_frame = nil
+      Entity.creation_sink = nil
+      return unless frame
+
+      if frame[:transparent] && @transparent_merge && !undo_stack.empty?
+        undo_stack.last[:entities].concat(frame[:entities])
+      else
+        undo_stack << frame
+      end
     end
 
     def abort_operation
       @operation_log << [:abort]
+      frame = @open_frame
+      @open_frame = nil
+      Entity.creation_sink = nil
+      frame[:entities].each { |e| e.delete! if e.respond_to?(:delete!) } if frame
+    end
+
+    def undo_stack
+      @undo_stack ||= []
+    end
+
+    # Emulates Sketchup.undo: removes everything the newest undo entry
+    # created. Returns that entry's name, or nil on an empty stack.
+    def undo_last_entry
+      frame = undo_stack.pop
+      return nil unless frame
+
+      frame[:entities].each { |e| e.delete! if e.respond_to?(:delete!) }
+      frame[:name]
     end
   end
 
@@ -1543,6 +1595,11 @@ module Sketchup
     self.last_vcb_value = value
   end
   def self.send_action(_action); end
+
+  # Real Sketchup.undo undoes the newest undo entry of the active model.
+  def self.undo
+    Model.current&.undo_last_entry
+  end
 
   # Real Sketchup.set_status_text(text, sb = SB_PROMPT) sets the status bar
   # prompt; recorded here purely so a spec can assert a picker actually

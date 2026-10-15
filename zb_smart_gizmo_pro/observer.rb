@@ -31,6 +31,7 @@ module Zbellbound::SmartGizmoPro
 
     def on_transaction(model)
       overlay = PLUGIN.active_overlay(model)
+      overlay&.model_transaction_observed if overlay.respond_to?(:model_transaction_observed)
       return unless overlay&.enabled?
 
       overlay.update_gizmo

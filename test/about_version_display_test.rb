@@ -128,11 +128,11 @@ class AboutVersionDisplayTest < Minitest::Test
 
   # -- 7. The production version --------------------------------------------
 
-  def test_the_production_version_is_exactly_1_5_5_with_no_build_label
+  def test_the_production_version_is_exactly_1_5_7_with_no_build_label
     source = File.read(File.expand_path('../zb_smart_gizmo_pro.rb', __dir__))
     assigned = source.scan(/^\s*PLUGIN_VERSION\s*=\s*'([^']+)'\.freeze\s*$/).flatten
 
-    assert_equal ['1.5.6'], assigned, 'PLUGIN_VERSION is assigned exactly once, to exactly 1.5.6'
+    assert_equal ['1.5.7'], assigned, 'PLUGIN_VERSION is assigned exactly once, to exactly 1.5.7'
     assert_match(/\A\d+\.\d+\.\d+\z/, assigned.first, 'a production version carries no DEV/RC label')
     assert_operator Gem::Version.new(assigned.first), :>, Gem::Version.new('1.5.4')
     assert_match(/extension\.version\s*=\s*PLUGIN_VERSION/, source, 'the extension registers this exact version')

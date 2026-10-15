@@ -666,6 +666,16 @@ module Zbellbound::SmartGizmoPro
       @model.active_view.invalidate
     end
 
+    # Called by the model observer for every transaction commit / undo /
+    # redo. Anything that happens after the Ctrl-drag array session last
+    # set `undo_top_ours` (its own commit/undo are followed by that
+    # assignment) means the newest undo entry may no longer be the
+    # session's, so the single-undo replace is disabled and the safe
+    # fallback is used instead.
+    def model_transaction_observed
+      @ctrl_array_session[:undo_top_ours] = false if @ctrl_array_session
+    end
+
     def selection_changed(selection)
       @selection = selection if selection
       @refresh_generation += 1
@@ -1246,6 +1256,12 @@ module Zbellbound::SmartGizmoPro
     def start_licensed_operation(name, next_transparent = false, transparent = false)
       return false unless license_permits_interaction?
 
+      # Any operation other than the Ctrl-drag array's own single-undo
+      # rebuild means the newest undo entry is no longer the drag copy (or
+      # the last array edit), so a later "/N" must not undo it. See
+      # apply_ctrl_drag_array_as_single_undo.
+      @ctrl_array_session[:undo_top_ours] = false if @ctrl_array_session
+
       @model.start_operation(name, true, next_transparent, transparent)
       true
     end
@@ -1459,6 +1475,9 @@ module Zbellbound::SmartGizmoPro
           next
         end
 
+        copy_committed = false
+        original_entities = nil
+        begin
         if @copy && !selected_entities.empty?
           tr_new = @last_transform[1]
           original_entities = selected_entities
@@ -1505,6 +1524,31 @@ module Zbellbound::SmartGizmoPro
         end
 
         @model.commit_operation
+        copy_committed = true
+        # The commit above fires a transaction notification (see
+        # model_transaction_observed); the entry just committed IS this
+        # session's own, so it is the one a later "/N" may replace.
+        @ctrl_array_session[:undo_top_ours] = true if @ctrl_array_session
+        rescue StandardError => e
+          # A failure while building the Ctrl-drag copy must not leave the
+          # 'Transform' operation open or half-applied: abort restores the
+          # originals and removes any partial copy as one clean step.
+          # Never abort once the commit has already happened.
+          @model.abort_operation unless copy_committed
+          @ctrl_array_session = nil
+          reset_smart_scale_session
+          reset_smart_scale_gesture
+          begin
+            @selection.clear
+            @selection.add(original_entities) if original_entities
+          rescue StandardError
+            nil
+          end
+          update_gizmo
+          @model.active_view.invalidate
+          UI.messagebox("Copy failed.\n\n#{e.message}")
+          next
+        end
         if @last_transform && @last_transform[2] && @last_transform[2][0] == :scale
           Sketchup.vcb_label = 'Scale'
           Sketchup.vcb_value = format_scale_display(@last_transform[2][2], @last_transform[2][4])
@@ -1957,8 +2001,9 @@ module Zbellbound::SmartGizmoPro
 
       return unless start_licensed_operation('Copy Array')
 
+      committed = false
+      new_entities = []
       begin
-        new_entities = []
         cumulative = IDENTITY
 
         copies.to_i.times do
@@ -1973,17 +2018,26 @@ module Zbellbound::SmartGizmoPro
         end
 
         @model.commit_operation
+        committed = true
+      rescue StandardError => e
+        # Never abort after the commit: that would target a different
+        # (earlier) undo entry instead of this one.
+        @model.abort_operation unless committed
+        UI.messagebox("Copy array failed.\n\n#{e.message}")
+      end
 
+      if committed
         # Selection after a successful array = original selection plus
         # every created copy, so the whole array is immediately visible
         # and actionable. The originals are re-added from `entities`
         # (never touched above) rather than re-read from the model.
-        @selection.clear
-        @selection.add(entities)
-        @selection.add(new_entities) unless new_entities.empty?
-      rescue StandardError => e
-        @model.abort_operation
-        UI.messagebox("Copy array failed.\n\n#{e.message}")
+        begin
+          @selection.clear
+          @selection.add(entities)
+          @selection.add(new_entities) unless new_entities.empty?
+        rescue StandardError => e
+          UI.messagebox("Copy array was created, but the selection could not be updated.\n\n#{e.message}")
+        end
       end
 
       update_gizmo
@@ -2053,7 +2107,12 @@ module Zbellbound::SmartGizmoPro
         vector: vector.clone,
         mode: nil,
         count: 1,
-        expected_selection: expected_selection.dup
+        expected_selection: expected_selection.dup,
+        # true while the newest undo entry is exactly the operation that
+        # produced the session's current copies (the drag's 'Transform',
+        # then each array edit's own entry) -- the precondition for
+        # replacing it in a single undo step.
+        undo_top_ours: true
       }
     end
 
@@ -2181,6 +2240,14 @@ module Zbellbound::SmartGizmoPro
         end
       end
 
+      if session[:undo_top_ours]
+        apply_ctrl_drag_array_as_single_undo(session, count, mode, view)
+        return
+      end
+
+      # Fallback (a separate operation, e.g. a typed distance re-edit, now
+      # sits on top of the undo stack so it cannot be replaced): the
+      # original transparent-merge request.
       return unless start_licensed_operation('Copy Array', false, true)
 
       begin
@@ -2225,6 +2292,124 @@ module Zbellbound::SmartGizmoPro
 
       update_gizmo
       view.invalidate
+    end
+
+    # Single-undo array edit. SketchUp does not reliably merge a second
+    # (transparent) operation into the drag's 'Transform' entry, which left
+    # "Transform" + "Copy Array" as two undo steps. Instead of asking for a
+    # merge, this replaces the newest undo entry outright: undo it (one
+    # step, restoring the exact pre-drag model), then rebuild the complete
+    # result -- every copy including the endpoint -- inside ONE new
+    # 'Copy Array' operation. The user's single Undo therefore returns to
+    # the exact state before the Ctrl-drag, whatever count was typed, and
+    # re-entering "/N" or "xN" keeps replacing that same single entry.
+    #
+    # Everything that can be rejected is checked BEFORE the undo, so a
+    # refused license, invalid count or unsupported selection never touches
+    # the model. If the rebuild itself fails after the undo, the operation
+    # is aborted and the previous array (count/mode) is rebuilt the same
+    # way, so the user is never left with the drag's copies simply gone.
+    def apply_ctrl_drag_array_as_single_undo(session, count, mode, view)
+      return unless license_permits_interaction?
+
+      # Sketchup.undo pops whatever is on top, so it may only run when that
+      # entry is provably this session's own. Every copy the session
+      # tracks must still be alive: if the user already pressed Undo (or
+      # anything removed them), the top entry is now an UNRELATED earlier
+      # operation and must never be undone. Close the window instead.
+      tracked = session[:originals] + session[:endpoint] + session[:intermediates]
+      unless tracked.all?(&:valid?)
+        @ctrl_array_session = nil
+        return
+      end
+
+      previous_count = session[:count]
+      previous_mode = session[:mode]
+
+      Sketchup.undo
+
+      # The undo must have removed the copies this session tracks. If any
+      # is still alive, the newest undo entry was not ours: put it back and
+      # leave the model exactly as it was.
+      if session[:endpoint].any?(&:valid?) || session[:intermediates].any?(&:valid?)
+        Sketchup.send_action('editRedo:')
+        session[:undo_top_ours] = false
+        UI.messagebox('Copy array could not replace the previous step, so nothing was changed.')
+        return
+      end
+
+      error = rebuild_ctrl_drag_array(session, count, mode)
+      if error
+        restore_error = rebuild_ctrl_drag_array(session, previous_count, previous_mode)
+        if restore_error
+          @ctrl_array_session = nil
+          UI.messagebox("Copy array failed and the previous copies could not be restored.\n\n#{error}")
+        else
+          UI.messagebox("Copy array failed.\n\n#{error}")
+        end
+      end
+
+      update_gizmo
+      view.invalidate
+    end
+
+    # One 'Copy Array' operation containing every copy of the array (index
+    # 1..count of the fixed drag vector, endpoint included). Returns nil on
+    # success or an error message string; on failure the operation is
+    # aborted and the session is left untouched.
+    def rebuild_ctrl_drag_array(session, count, mode)
+      return 'Not authorized.' unless start_licensed_operation('Copy Array')
+
+      committed = false
+      begin
+        groups = []
+        (1..count).each do |i|
+          multiplier = mode == :external ? i.to_f : i.to_f / count
+          step_tr = ctrl_drag_array_step_transformation(session[:vector], multiplier)
+          group = session[:originals].map do |entity|
+            copy = duplicate_supported_entity(entity)
+            raise 'Could not copy selection' unless copy
+
+            copy.transform!(step_tr)
+            copy
+          end
+          groups << group
+        end
+
+        @model.commit_operation
+        committed = true
+      rescue StandardError => e
+        # Never abort after the commit: that would hit a different undo
+        # entry than the one this rebuild just created.
+        @model.abort_operation unless committed
+        return e.message
+      end
+
+      # "/N" ends at the full drag vector (index count); "xN" starts at it
+      # (index 1). Either way the endpoint is the copy sitting at 1x.
+      endpoint_index = mode == :external ? 0 : count - 1
+      session[:endpoint] = groups[endpoint_index]
+      session[:intermediates] = groups.each_with_index.reject { |_g, i| i == endpoint_index }.flat_map(&:first)
+      session[:mode] = mode
+      session[:count] = count
+      session[:undo_top_ours] = true
+      @ctrl_array_session = session
+
+      begin
+        @selection.clear
+        @selection.add(session[:originals])
+        @selection.add(session[:intermediates]) unless session[:intermediates].empty?
+        @selection.add(session[:endpoint]) unless session[:endpoint].empty?
+
+        # Same reason as build_ctrl_drag_array_session: a later
+        # selection-changed echo of THIS change must not close the window.
+        session[:expected_selection] = @selection.to_a
+        @ctrl_array_session = session
+      rescue StandardError => e
+        UI.messagebox("Copy array was created, but the selection could not be updated.\n\n#{e.message}")
+      end
+
+      nil
     end
 
     def ctrl_drag_array_step_transformation(vector, multiplier)
